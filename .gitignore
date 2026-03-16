@@ -1,0 +1,24 @@
+# Compiled kernels
+minitorch/cuda_kernels/*.so
+
+# Python
+__pycache__/
+*.egg-info/
+*.pyc
+*.pyo
+dist/
+build/
+*.egg
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Benchmark outputs
+benchmarks/results/
+benchmarks/*.png
+benchmarks/*.csv
