@@ -116,6 +116,79 @@ python project/run_benchmark.py --batch-sizes 1 2 4 8 --seq-lengths 128 256 512 
 - **Throughput**: Tokens/second for generation
 - **Correctness**: Output matches standard attention exactly
 
+## TODO
+
+### Repository completeness
+
+- [ ] Copy the base MiniTorch files from hw3 into `minitorch/`
+- [ ] Add missing CUDA source files required by `compile_cuda.sh` (for example `src/combine.cu`)
+- [ ] Verify that `pip install -e .` and `import minitorch` work in a clean environment
+
+### Block manager
+
+- [ ] Implement `BlockManager.allocate_block()`
+- [ ] Implement `BlockManager.allocate_blocks_for_sequence()`
+- [ ] Implement `BlockManager.append_token_to_sequence()`
+- [ ] Implement `BlockManager.free_sequence()`
+- [ ] Implement `BlockManager.compute_fragmentation()`
+- [ ] Replace placeholder NumPy storage in `KVBlock` with the intended tensor / device-backed storage
+
+### Attention implementation
+
+- [ ] Implement `standard_attention()` as the contiguous correctness baseline
+- [ ] Implement `paged_attention_ref()` for Python-side validation
+- [ ] Implement `PagedAttentionKernel._load_library()`
+- [ ] Implement `PagedAttentionKernel.forward()`
+- [ ] Initialize Q / K / V / output projections in `PagedMultiHeadAttention`
+- [ ] Implement `PagedMultiHeadAttention.forward_prefill()`
+- [ ] Implement `PagedMultiHeadAttention.forward_decode()`
+
+### Transformer integration
+
+- [ ] Implement `PagedTransformerLayer.forward_prefill()`
+- [ ] Implement `PagedTransformerLayer.forward_decode()`
+- [ ] Implement `PagedDecoderLM.generate()`
+- [ ] Verify end-to-end prefill/decode behavior with sequence position tracking
+
+### CUDA kernel
+
+- [ ] Implement `warp_reduce_sum()`
+- [ ] Implement `warp_reduce_max()`
+- [ ] Implement `paged_attention_v1_kernel()`
+- [ ] Validate kernel launch configuration across supported head dimensions
+- [ ] Compile and test `minitorch/cuda_kernels/paged_attention.so`
+
+### Optional advanced TODOs
+
+- [ ] Rework KV cache memory layout to better match coalesced GPU memory access
+- [ ] Add a higher-performance kernel path inspired by vLLM's paged attention design
+- [ ] Introduce thread-group / warp-level work partitioning instead of a purely naive per-head kernel
+- [ ] Use shared memory staging for query vectors and partial reductions
+- [ ] Implement more efficient online softmax and value accumulation reductions
+- [ ] Add template-specialized kernels for different `head_dim`, `block_size`, and thread-count configurations
+- [ ] Benchmark multiple kernel variants and select launch parameters per configuration
+- [ ] Explore multi-block-per-sequence kernel decomposition for long-context decode
+- [ ] Add CUDA profiling with Nsight or equivalent tooling to analyze memory bandwidth and occupancy
+- [ ] Compare the course-project kernel against a vLLM-style design in the final report
+- [ ] Evaluate tradeoffs between implementation simplicity, numerical stability, and throughput
+- [ ] Document which optimizations are correctness-preserving versus performance-only
+
+### Tests
+
+- [ ] Fill in `tests/test_block_manager.py`
+- [ ] Fill in `tests/test_paged_attention.py`
+- [ ] Fill in the remaining performance cycle test in `tests/test_benchmark.py`
+- [ ] Add an end-to-end inference smoke test once the model path is runnable
+
+### Benchmarks and reporting
+
+- [ ] Implement throughput measurement in `project/run_benchmark.py`
+- [ ] Implement fragmentation measurement in `project/run_benchmark.py`
+- [ ] Implement max-batch-size search in `project/run_benchmark.py`
+- [ ] Implement correctness comparison in `project/run_benchmark.py`
+- [ ] Save benchmark outputs to `benchmarks/results/benchmark_results.csv`
+- [ ] Add benchmark plots / summary discussion to `benchmarks/README.md`
+
 ## References
 
 - Kwon et al., "Efficient Memory Management for Large Language Model Serving with PagedAttention", SOSP 2023
