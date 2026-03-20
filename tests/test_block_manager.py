@@ -34,9 +34,11 @@ class TestBlockAllocation:
     def test_initial_state(self, small_manager):
         assert small_manager.num_free_blocks == 8
         assert small_manager.num_used_blocks == 0
+        assert small_manager.key_cache.shape == (8, 4, 2, 8)
+        assert small_manager.value_cache.shape == (8, 4, 2, 8)
 
     def test_allocate_single_block(self, small_manager):
-        # TODO: Test allocating a single block
+        # TODO: Test allocating a single block in the global-cache design
         pass
 
     def test_allocate_returns_unique_blocks(self, small_manager):
@@ -71,6 +73,10 @@ class TestSequenceManagement:
         #       verify blocks returned to free pool
         pass
 
+    def test_write_token_kv_writes_global_cache(self, small_manager):
+        # TODO: Verify that appended token KV is written into the global cache
+        pass
+
 
 # ---------------------------------------------------------------------------
 # Block table
@@ -83,6 +89,10 @@ class TestBlockTable:
 
     def test_get_block_table_tensor(self, small_manager):
         # TODO: Verify flat list of block ids matches block table
+        pass
+
+    def test_get_physical_location(self, small_manager):
+        # TODO: Verify logical token positions map to the right block/slot pair
         pass
 
 

@@ -50,8 +50,8 @@ def standard_attention(
 
 def paged_attention_ref(
     query: Tensor,
-    key_cache: List[np.ndarray],
-    value_cache: List[np.ndarray],
+    key_cache: np.ndarray,
+    value_cache: np.ndarray,
     block_tables: List[List[int]],
     context_lens: List[int],
     block_size: int = DEFAULT_BLOCK_SIZE,
@@ -68,8 +68,10 @@ def paged_attention_ref(
 
     Args:
         query:        Query tensor (batch, n_head, 1, head_dim) for decode step.
-        key_cache:    List of key blocks (physical block pool).
-        value_cache:  List of value blocks (physical block pool).
+        key_cache:    Global key cache with shape
+                      (num_blocks, block_size, n_head, head_dim).
+        value_cache:  Global value cache with shape
+                      (num_blocks, block_size, n_head, head_dim).
         block_tables: Per-sequence mapping from logical to physical block ids.
         context_lens: Number of context tokens per sequence.
         block_size:   Tokens per block.

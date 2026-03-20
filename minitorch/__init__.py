@@ -15,9 +15,14 @@ from .scalar import Scalar, ScalarHistory, derivative_check  # noqa: F401,F403
 from .scalar_functions import ScalarFunction  # noqa: F401,F403
 from .tensor import *  # noqa: F401,F403
 from .tensor_data import *  # noqa: F401,F403
-from .tensor_functions import *  # noqa: F401,F403
 from .tensor_ops import *  # noqa: F401,F403
 from .testing import MathTest, MathTestVariable  # type: ignore # noqa: F401,F403
+
+try:
+    from .tensor_functions import *  # noqa: F401,F403
+except ModuleNotFoundError as exc:
+    if exc.name != "torch":
+        raise
 
 # Project-specific modules
 from .transformer import *  # noqa: F401,F403
