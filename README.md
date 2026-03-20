@@ -126,12 +126,12 @@ python project/run_benchmark.py --batch-sizes 1 2 4 8 --seq-lengths 128 256 512 
 
 ### Block manager
 
-- [ ] Implement `BlockManager.allocate_block()`
-- [ ] Implement `BlockManager.allocate_blocks_for_sequence()`
-- [ ] Implement `BlockManager.append_token_to_sequence()`
-- [ ] Implement `BlockManager.free_sequence()`
-- [ ] Implement `BlockManager.compute_fragmentation()`
-- [ ] Replace placeholder NumPy storage in `KVBlock` with the intended tensor / device-backed storage
+- [x] Implement `BlockManager.allocate_block()`
+- [x] Implement `BlockManager.allocate_blocks_for_sequence()`
+- [x] Implement `BlockManager.append_token_to_sequence()`
+- [x] Implement `BlockManager.free_sequence()`
+- [x] Implement `BlockManager.compute_fragmentation()`
+- [x] Move KV storage to global `key_cache` / `value_cache` owned by `BlockManager`
 
 ### Attention implementation
 
@@ -175,7 +175,7 @@ python project/run_benchmark.py --batch-sizes 1 2 4 8 --seq-lengths 128 256 512 
 
 ### Tests
 
-- [ ] Fill in `tests/test_block_manager.py`
+- [x] Fill in `tests/test_block_manager.py`
 - [ ] Fill in `tests/test_paged_attention.py`
 - [ ] Fill in the remaining performance cycle test in `tests/test_benchmark.py`
 - [ ] Add an end-to-end inference smoke test once the model path is runnable
