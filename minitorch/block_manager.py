@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import numpy as np
 from typing import Dict, List, Optional, Tuple
-
+import math
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -137,8 +137,17 @@ class BlockManager:
           3. Optionally zero the corresponding cache slices
           4. Return the KVBlock metadata object
         """
-        # TODO: Implement block allocation for the global-cache architecture.
-        raise NotImplementedError
+ 
+        if self.num_free_blocks == 0:
+            raise RuntimeError("No free blocks available")
+
+        block_id = self.free_block_ids.pop(0)
+        block = self.blocks[block_id]
+        block.ref_count = 1
+        block.num_filled = 0
+        self.key_cache[block_id].fill(0)
+        self.value_cache[block_id].fill(0)
+        return block
 
     def allocate_blocks_for_sequence(self, seq_id: int, num_tokens: int) -> BlockTable:
         """Allocate enough blocks to hold `num_tokens` tokens for a sequence.
@@ -147,8 +156,19 @@ class BlockManager:
         The actual K/V vectors will later be written into `key_cache` and
         `value_cache`, not into the KVBlock objects themselves.
         """
-        # TODO: Implement sequence block allocation.
-        raise NotImplementedError
+        self.context_lens[seq_id] = num_tokens
+        num_blocks = math.ceil(num_tokens / self.block_size)
+        block_table = BlockTable(seq_id)
+        for i in range(num_blocks):
+            block = self.allocate_block()
+            block_table.append_block(block.block_id)
+            if num_tokens>self.block_size:
+                block.num_filled = self.block_size
+            else:
+                block.num_filled = num_tokens
+            num_tokens -= block.num_filled
+        self.block_tables[seq_id] = block_table
+        return block_table
 
     def append_token_to_sequence(self, seq_id: int) -> KVBlock:
         """Reserve one new token slot for an existing sequence.
@@ -156,8 +176,20 @@ class BlockManager:
         If the current tail block is full, allocate a new block and append its
         id to the sequence's BlockTable.
         """
-        # TODO: Implement single-token append.
-        raise NotImplementedError
+        block_table = self.block_tables[seq_id]
+        if not block_table.block_ids:
+            block = self.allocate_block()
+            block_id = block.block_id
+            block_table.append_block(block.block_id)
+        else:
+            block_id = block_table.block_ids[-1]
+            if self.blocks[block_id].is_full:
+                block = self.allocate_block()
+                block_id = block.block_id
+                block_table.append_block(block.block_id)
+        self.blocks[block_id].num_filled += 1
+        self.context_lens[seq_id] += 1
+        return self.blocks[block_id]
 
     def free_sequence(self, seq_id: int) -> None:
         """Free all blocks associated with `seq_id`.
@@ -165,8 +197,16 @@ class BlockManager:
         This should update ref counts, return reusable block ids to the free
         pool, and optionally clear the corresponding global cache slices.
         """
-        # TODO: Implement sequence deallocation.
-        raise NotImplementedError
+        block_table = self.block_tables[seq_id]
+        for block_id in block_table.block_ids:
+            self.blocks[block_id].ref_count -= 1
+            if self.blocks[block_id].ref_count == 0:
+                self.blocks[block_id].num_filled = 0
+                self.key_cache[block_id].fill(0)
+                self.value_cache[block_id].fill(0)
+                self.free_block_ids.append(block_id)
+        del self.block_tables[seq_id]
+        del self.context_lens[seq_id]
 
     # ----- Cache access helpers -------------------------------------------
 
@@ -176,8 +216,10 @@ class BlockManager:
 
     def get_physical_location(self, seq_id: int, token_index: int) -> Tuple[int, int]:
         """Map a token position to `(block_id, slot_idx)` in the global cache."""
-        # TODO: Implement logical-position -> physical-cache mapping.
-        raise NotImplementedError
+        block_table = self.block_tables[seq_id]
+        block_id = block_table.block_ids[token_index // self.block_size]
+        slot_idx = token_index % self.block_size
+        return block_id, slot_idx
 
     def write_kv_slot(
         self,
@@ -187,8 +229,12 @@ class BlockManager:
         value: np.ndarray,
     ) -> None:
         """Write one token's K/V vectors into the global cache."""
-        # TODO: Validate shapes and write into `key_cache` / `value_cache`.
-        raise NotImplementedError
+        if key.shape != (self.n_head, self.head_dim):
+            raise ValueError(f"Key shape must be ({self.n_head}, {self.head_dim})")
+        if value.shape != (self.n_head, self.head_dim):
+            raise ValueError(f"Value shape must be ({self.n_head}, {self.head_dim})")
+        self.key_cache[block_id, slot_idx, :, :] = key
+        self.value_cache[block_id, slot_idx, :, :] = value
 
     def write_token_kv(
         self,
@@ -205,14 +251,31 @@ class BlockManager:
           4. Return `(block_id, slot_idx)`
         """
         # TODO: Implement append-and-write helper.
-        raise NotImplementedError
+        block = self.append_token_to_sequence(seq_id)
+        slot_idx = block.num_filled - 1
+        self.write_kv_slot(block.block_id, slot_idx, key, value)
+        return block.block_id, slot_idx
 
     def get_block_table_array(
         self, seq_ids: List[int], pad_value: int = -1
     ) -> np.ndarray:
         """Build a padded block-table array suitable for kernel input."""
-        # TODO: Implement padded block-table export for CUDA / reference paths.
-        raise NotImplementedError
+        block_tables = [self.block_tables[seq_id] for seq_id in seq_ids]
+        max_blocks_per_seq = max(
+            (block_table.num_blocks for block_table in block_tables),
+            default=0,
+        )
+        out = np.full(
+            (len(seq_ids), max_blocks_per_seq),
+            pad_value,
+            dtype=np.int32,
+        )
+        for row, block_table in enumerate(block_tables):
+            out[row, : block_table.num_blocks] = np.array(
+                block_table.block_ids,
+                dtype=np.int32,
+            )
+        return out
 
     # ----- Introspection ---------------------------------------------------
 
@@ -226,8 +289,35 @@ class BlockManager:
 
     def compute_fragmentation(self) -> Dict[str, float]:
         """Compute internal and external fragmentation metrics."""
-        # TODO: Implement fragmentation metrics for the paged-cache design.
-        raise NotImplementedError
+        used_blocks = [
+            block for block in self.blocks.values() if block.num_filled > 0
+        ]
+
+        if not used_blocks:
+            return {"internal": 0.0, "external": 0.0}
+
+        allocated_capacity = len(used_blocks) * self.block_size
+        used_slots = sum(block.num_filled for block in used_blocks)
+        wasted_slots = allocated_capacity - used_slots
+        internal_fragmentation = wasted_slots / allocated_capacity
+
+        used_block_ids = sorted(block.block_id for block in used_blocks)
+        if len(used_block_ids) <= 1 or self.num_free_blocks == 0:
+            external_fragmentation = 0.0
+        else:
+            low = used_block_ids[0]
+            high = used_block_ids[-1]
+            free_between = sum(
+                1
+                for block_id in range(low, high + 1)
+                if self.blocks[block_id].num_filled == 0
+            )
+            external_fragmentation = free_between / self.num_free_blocks
+
+        return {
+            "internal": internal_fragmentation,
+            "external": external_fragmentation,
+        }
 
     def __repr__(self) -> str:
         return (
