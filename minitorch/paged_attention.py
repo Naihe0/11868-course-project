@@ -40,8 +40,25 @@ def standard_attention(
     Returns:
         Attention output (batch, n_head, seq_q, head_dim).
     """
-    # TODO: Implement standard attention as a correctness baseline
-    raise NotImplementedError
+    batch_size, n_head, seq_q, head_dim = query.shape
+    _, _, seq_kv, _ = key.shape
+
+    q_expanded = query.contiguous().view(batch_size, n_head, seq_q, 1, head_dim)
+    k_expanded = key.contiguous().view(batch_size, n_head, 1, seq_kv, head_dim)
+    scores = (q_expanded * k_expanded).sum(dim=4).view(
+        batch_size, n_head, seq_q, seq_kv
+    ) / np.sqrt(head_dim)
+
+    if mask is not None:
+        scores = scores + mask
+
+    weights = softmax(scores, dim=3)
+    weight_expanded = weights.contiguous().view(batch_size, n_head, seq_q, seq_kv, 1)
+    value_expanded = value.contiguous().view(batch_size, n_head, 1, seq_kv, head_dim)
+    output = (weight_expanded * value_expanded).sum(dim=3).view(
+        batch_size, n_head, seq_q, head_dim
+    )
+    return output
 
 
 # ---------------------------------------------------------------------------
@@ -81,12 +98,29 @@ def paged_attention_ref(
     Returns:
         Attention output (batch, n_head, 1, head_dim).
     """
-    # TODO: Implement reference PagedAttention
-    # Steps:
-    #   1. For each sequence, gather K/V from blocks using block_table
-    #   2. Compute scaled dot product attention
-    #   3. Return output
-    raise NotImplementedError
+    outputs = []
+    query_np = query.to_numpy()
+
+    for batch_idx, block_table in enumerate(block_tables):
+        context_len = context_lens[batch_idx]
+        gathered_keys = []
+        gathered_values = []
+
+        for token_idx in range(context_len):
+            logical_block_idx = token_idx // block_size
+            slot_idx = token_idx % block_size
+            block_id = block_table[logical_block_idx]
+            gathered_keys.append(key_cache[block_id, slot_idx])
+            gathered_values.append(value_cache[block_id, slot_idx])
+
+        key_np = np.stack(gathered_keys, axis=1).reshape(1, n_head, context_len, head_dim)
+        value_np = np.stack(gathered_values, axis=1).reshape(1, n_head, context_len, head_dim)
+        query_i = tensor_from_numpy(query_np[batch_idx : batch_idx + 1].astype(datatype), backend=query.backend)
+        key_i = tensor_from_numpy(key_np.astype(datatype), backend=query.backend)
+        value_i = tensor_from_numpy(value_np.astype(datatype), backend=query.backend)
+        outputs.append(standard_attention(query_i, key_i, value_i).to_numpy())
+
+    return tensor_from_numpy(np.concatenate(outputs, axis=0).astype(datatype), backend=query.backend)
 
 
 # ---------------------------------------------------------------------------

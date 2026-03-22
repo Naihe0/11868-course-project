@@ -97,6 +97,15 @@ pytest tests/
 # Run specific test suites
 pytest tests/test_block_manager.py -v
 pytest tests/test_paged_attention.py -v
+
+# Run only BlockManager tests quietly
+pytest tests/test_block_manager.py -q
+
+# Run only PagedAttention reference / correctness tests quietly
+pytest tests/test_paged_attention.py -q
+
+# Run one specific PagedAttention test
+pytest tests/test_paged_attention.py -k test_single_sequence_multi_block -v
 ```
 
 ### Running Benchmarks

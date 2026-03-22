@@ -23,6 +23,65 @@ from minitorch.paged_attention import (
     paged_attention_ref,
     PagedAttentionKernel,
 )
+from minitorch.tensor_functions import tensor_from_numpy
+from minitorch.tensor_ops import SimpleBackend
+
+
+def to_tensor(x: np.ndarray):
+    return tensor_from_numpy(x.astype(np.float32), backend=SimpleBackend)
+
+
+def causal_mask(seq_q: int, seq_kv: int):
+    mask = np.triu(
+        np.full((1, 1, seq_q, seq_kv), -1e9, dtype=np.float32),
+        k=1,
+    )
+    return to_tensor(mask)
+
+
+def manual_attention(query, key, value, mask=None):
+    scores = np.matmul(query, np.swapaxes(key, -1, -2)) / np.sqrt(query.shape[-1])
+    if mask is not None:
+        scores = scores + mask
+    scores = scores - np.max(scores, axis=-1, keepdims=True)
+    weights = np.exp(scores)
+    weights = weights / np.sum(weights, axis=-1, keepdims=True)
+    return np.matmul(weights, value)
+
+
+def build_paged_cache(
+    keys_by_seq,
+    values_by_seq,
+    block_size,
+):
+    n_head = keys_by_seq[0].shape[1]
+    head_dim = keys_by_seq[0].shape[2]
+    total_blocks = sum((len(seq) + block_size - 1) // block_size for seq in keys_by_seq)
+    key_cache = np.zeros((total_blocks, block_size, n_head, head_dim), dtype=np.float32)
+    value_cache = np.zeros_like(key_cache)
+    block_tables = []
+    next_block_id = 0
+
+    for seq_keys, seq_values in zip(keys_by_seq, values_by_seq):
+        seq_len = seq_keys.shape[0]
+        seq_block_ids = []
+        for start in range(0, seq_len, block_size):
+            end = min(start + block_size, seq_len)
+            key_cache[next_block_id, : end - start] = seq_keys[start:end]
+            value_cache[next_block_id, : end - start] = seq_values[start:end]
+            seq_block_ids.append(next_block_id)
+            next_block_id += 1
+        block_tables.append(seq_block_ids)
+
+    return key_cache, value_cache, block_tables
+
+
+def _cuda_available() -> bool:
+    try:
+        import pycuda.autoinit  # noqa: F401
+        return True
+    except Exception:
+        return False
 
 
 # ---------------------------------------------------------------------------
@@ -45,12 +104,44 @@ def default_config():
 
 class TestStandardAttention:
     def test_single_head_identity(self, rng, default_config):
-        # TODO: Q=K=V should give attention output equal to V
-        pass
+        n_head = 1
+        head_dim = default_config["head_dim"]
+        seq_len = 4
+
+        base = np.eye(seq_len, dtype=np.float32).reshape(1, 1, seq_len, seq_len)
+        query = to_tensor(base[:, :, :, :head_dim] if head_dim < seq_len else np.pad(base, ((0, 0), (0, 0), (0, 0), (0, head_dim - seq_len))))
+        key = to_tensor(query.to_numpy())
+        value_np = rng.standard_normal((1, n_head, seq_len, head_dim), dtype=np.float32)
+        value = to_tensor(value_np)
+
+        output = standard_attention(query, key, value)
+        expected = manual_attention(query.to_numpy(), query.to_numpy(), value_np)
+
+        np.testing.assert_allclose(output.to_numpy(), expected, atol=1e-5, rtol=1e-5)
 
     def test_causal_mask(self, rng, default_config):
-        # TODO: Verify future tokens do not influence past outputs
-        pass
+        n_head = 1
+        head_dim = default_config["head_dim"]
+        seq_len = 4
+
+        query_np = rng.standard_normal((1, n_head, seq_len, head_dim), dtype=np.float32)
+        key_np = rng.standard_normal((1, n_head, seq_len, head_dim), dtype=np.float32)
+        value_np = rng.standard_normal((1, n_head, seq_len, head_dim), dtype=np.float32)
+
+        output = standard_attention(
+            to_tensor(query_np),
+            to_tensor(key_np),
+            to_tensor(value_np),
+            causal_mask(seq_len, seq_len),
+        )
+        expected = manual_attention(
+            query_np,
+            key_np,
+            value_np,
+            np.triu(np.full((1, 1, seq_len, seq_len), -1e9, dtype=np.float32), k=1),
+        )
+
+        np.testing.assert_allclose(output.to_numpy(), expected, atol=1e-5, rtol=1e-5)
 
 
 # ---------------------------------------------------------------------------
@@ -60,23 +151,143 @@ class TestStandardAttention:
 class TestPagedVsStandard:
     def test_single_sequence_single_block(self, rng, default_config):
         """Sequence fits in one block — paged output should match standard."""
-        # TODO: Implement
-        pass
+        n_head = default_config["n_head"]
+        head_dim = default_config["head_dim"]
+        block_size = default_config["block_size"]
+        seq_len = 3
+
+        query_np = rng.standard_normal((1, n_head, 1, head_dim), dtype=np.float32)
+        keys_np = rng.standard_normal((seq_len, n_head, head_dim), dtype=np.float32)
+        values_np = rng.standard_normal((seq_len, n_head, head_dim), dtype=np.float32)
+
+        key_cache, value_cache, block_tables = build_paged_cache([keys_np], [values_np], block_size)
+        paged_out = paged_attention_ref(
+            to_tensor(query_np),
+            key_cache,
+            value_cache,
+            block_tables,
+            [seq_len],
+            block_size=block_size,
+            n_head=n_head,
+            head_dim=head_dim,
+        )
+
+        expected = manual_attention(
+            query_np,
+            np.transpose(keys_np[None, ...], (0, 2, 1, 3)),
+            np.transpose(values_np[None, ...], (0, 2, 1, 3)),
+        )
+        np.testing.assert_allclose(paged_out.to_numpy(), expected, atol=1e-5, rtol=1e-5)
 
     def test_single_sequence_multi_block(self, rng, default_config):
         """Sequence spans multiple blocks."""
-        # TODO: Implement
-        pass
+        n_head = default_config["n_head"]
+        head_dim = default_config["head_dim"]
+        block_size = default_config["block_size"]
+        seq_len = 10
+
+        query_np = rng.standard_normal((1, n_head, 1, head_dim), dtype=np.float32)
+        keys_np = rng.standard_normal((seq_len, n_head, head_dim), dtype=np.float32)
+        values_np = rng.standard_normal((seq_len, n_head, head_dim), dtype=np.float32)
+
+        key_cache, value_cache, block_tables = build_paged_cache([keys_np], [values_np], block_size)
+        paged_out = paged_attention_ref(
+            to_tensor(query_np),
+            key_cache,
+            value_cache,
+            block_tables,
+            [seq_len],
+            block_size=block_size,
+            n_head=n_head,
+            head_dim=head_dim,
+        )
+
+        expected = manual_attention(
+            query_np,
+            np.transpose(keys_np[None, ...], (0, 2, 1, 3)),
+            np.transpose(values_np[None, ...], (0, 2, 1, 3)),
+        )
+        np.testing.assert_allclose(paged_out.to_numpy(), expected, atol=1e-5, rtol=1e-5)
 
     def test_batch_different_context_lens(self, rng, default_config):
         """Batch of sequences with varying context lengths."""
-        # TODO: Implement
-        pass
+        n_head = default_config["n_head"]
+        head_dim = default_config["head_dim"]
+        block_size = default_config["block_size"]
+        seq_lens = [3, 7, 5]
+        batch_size = len(seq_lens)
+
+        query_np = rng.standard_normal((batch_size, n_head, 1, head_dim), dtype=np.float32)
+        keys_by_seq = [
+            rng.standard_normal((seq_len, n_head, head_dim), dtype=np.float32)
+            for seq_len in seq_lens
+        ]
+        values_by_seq = [
+            rng.standard_normal((seq_len, n_head, head_dim), dtype=np.float32)
+            for seq_len in seq_lens
+        ]
+
+        key_cache, value_cache, block_tables = build_paged_cache(keys_by_seq, values_by_seq, block_size)
+        paged_out = paged_attention_ref(
+            to_tensor(query_np),
+            key_cache,
+            value_cache,
+            block_tables,
+            seq_lens,
+            block_size=block_size,
+            n_head=n_head,
+            head_dim=head_dim,
+        )
+
+        expected_rows = []
+        for i, seq_len in enumerate(seq_lens):
+            expected_rows.append(
+                manual_attention(
+                    query_np[i : i + 1],
+                    np.transpose(keys_by_seq[i][None, ...], (0, 2, 1, 3)),
+                    np.transpose(values_by_seq[i][None, ...], (0, 2, 1, 3)),
+                )
+            )
+        expected = np.concatenate(expected_rows, axis=0)
+        np.testing.assert_allclose(paged_out.to_numpy(), expected, atol=1e-5, rtol=1e-5)
 
     def test_block_size_sweep(self, rng):
         """Verify correctness across different block sizes."""
-        # TODO: Implement for block_sizes = [1, 4, 8, 16, 32]
-        pass
+        n_head = 2
+        head_dim = 8
+        seq_len = 11
+        query_np = rng.standard_normal((1, n_head, 1, head_dim), dtype=np.float32)
+        keys_np = rng.standard_normal((seq_len, n_head, head_dim), dtype=np.float32)
+        values_np = rng.standard_normal((seq_len, n_head, head_dim), dtype=np.float32)
+
+        expected = manual_attention(
+            query_np,
+            np.transpose(keys_np[None, ...], (0, 2, 1, 3)),
+            np.transpose(values_np[None, ...], (0, 2, 1, 3)),
+        )
+
+        for block_size in [1, 4, 8, 16, 32]:
+            key_cache, value_cache, block_tables = build_paged_cache(
+                [keys_np],
+                [values_np],
+                block_size,
+            )
+            paged_out = paged_attention_ref(
+                to_tensor(query_np),
+                key_cache,
+                value_cache,
+                block_tables,
+                [seq_len],
+                block_size=block_size,
+                n_head=n_head,
+                head_dim=head_dim,
+            )
+            np.testing.assert_allclose(
+                paged_out.to_numpy(),
+                expected,
+                atol=1e-5,
+                rtol=1e-5,
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -87,20 +298,11 @@ class TestPagedVsStandard:
     not _cuda_available(),
     reason="CUDA not available",
 )
+@pytest.mark.skip(reason="PagedAttention CUDA kernel wrapper not implemented yet")
 class TestPagedAttentionKernel:
     def test_kernel_matches_reference(self, rng, default_config):
         """CUDA kernel output should match Python reference implementation."""
-        # TODO: Implement
-        pass
+        raise NotImplementedError
 
     def test_kernel_batch(self, rng, default_config):
-        # TODO: Test batched CUDA kernel
-        pass
-
-
-def _cuda_available() -> bool:
-    try:
-        import pycuda.autoinit  # noqa: F401
-        return True
-    except Exception:
-        return False
+        raise NotImplementedError
