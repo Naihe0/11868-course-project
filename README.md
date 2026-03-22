@@ -154,10 +154,10 @@ python project/run_benchmark.py --batch-sizes 1 2 4 8 --seq-lengths 128 256 512 
 
 ### Transformer integration
 
-- [ ] Implement `PagedTransformerLayer.forward_prefill()`
-- [ ] Implement `PagedTransformerLayer.forward_decode()`
-- [ ] Implement `PagedDecoderLM.generate()`
-- [ ] Verify end-to-end prefill/decode behavior with sequence position tracking
+- [x] Implement `PagedTransformerLayer.forward_prefill()`
+- [x] Implement `PagedTransformerLayer.forward_decode()`
+- [x] Implement `PagedDecoderLM.generate()`
+- [x] Verify end-to-end prefill/decode behavior with sequence position tracking
 
 ### CUDA kernel
 
