@@ -187,7 +187,7 @@ python project/run_benchmark.py --batch-sizes 1 2 4 8 --seq-lengths 128 256 512 
 - [x] Fill in `tests/test_block_manager.py`
 - [x] Fill in `tests/test_paged_attention.py`
 - [ ] Fill in the remaining performance cycle test in `tests/test_benchmark.py`
-- [ ] Add an end-to-end inference smoke test once the model path is runnable
+- [x] Add an end-to-end inference smoke test once the model path is runnable
 
 ### Benchmarks and reporting
 

@@ -25,10 +25,9 @@ from minitorch.paged_attention import (
     PagedMultiHeadAttention,
 )
 from minitorch.tensor_functions import tensor_from_numpy
-from minitorch.tensor_ops import TensorBackend, SimpleBackend
-from minitorch.fast_ops import FastOps
+from minitorch.tensor_ops import SimpleBackend
 
-_test_backend = TensorBackend(FastOps)
+_test_backend = SimpleBackend
 
 
 def to_tensor(x: np.ndarray):
@@ -83,6 +82,84 @@ def build_paged_cache(
 class IdentityProjection:
     def __call__(self, x):
         return x
+
+
+class ScaleModule:
+    def __init__(self, scale: float, shift: float = 0.0):
+        self.scale = scale
+        self.shift = shift
+
+    def __call__(self, x):
+        return to_tensor(x.to_numpy() * self.scale + self.shift)
+
+
+class FakePagedAttentionModule:
+    def __init__(self, scale: float, n_head: int, head_dim: int, block_size: int):
+        self.scale = scale
+        self.n_head = n_head
+        self.head_dim = head_dim
+        self.block_size = block_size
+
+    def _heads(self, x):
+        x_np = x.to_numpy()
+        batch_size, seq_len, _ = x_np.shape
+        return x_np.reshape(batch_size, seq_len, self.n_head, self.head_dim)
+
+    def forward_prefill(self, x, block_manager, seq_ids):
+        x_heads = self._heads(x)
+        batch_size, seq_len, _, _ = x_heads.shape
+
+        for batch_idx, seq_id in enumerate(seq_ids):
+            block_table = block_manager.allocate_blocks_for_sequence(seq_id, seq_len)
+            for logical_block_idx, block_id in enumerate(block_table.block_ids):
+                block = block_manager.blocks[block_id]
+                start = logical_block_idx * self.block_size
+                end = start + block.num_filled
+                block_manager.key_cache[block_id, : block.num_filled] = x_heads[batch_idx, start:end]
+                block_manager.value_cache[block_id, : block.num_filled] = x_heads[batch_idx, start:end]
+
+        return to_tensor(x.to_numpy() * self.scale)
+
+    def forward_decode(self, x, block_manager, seq_ids):
+        x_heads = self._heads(x)[:, 0]
+
+        for batch_idx, seq_id in enumerate(seq_ids):
+            if seq_id not in block_manager.block_tables:
+                block_manager.allocate_blocks_for_sequence(seq_id, 0)
+            block_manager.write_token_kv(seq_id, x_heads[batch_idx], x_heads[batch_idx])
+
+        return to_tensor(x.to_numpy() * self.scale)
+
+
+class FakeTokenEmbedding:
+    def __init__(self, n_embd: int):
+        self.n_embd = n_embd
+
+    def __call__(self, idx):
+        idx_np = idx.to_numpy().astype(np.float32)
+        return to_tensor(np.repeat(idx_np[..., None], self.n_embd, axis=2) / 10.0)
+
+
+class FakePositionEmbedding:
+    def __init__(self, n_embd: int):
+        self.n_embd = n_embd
+
+    def __call__(self, idx):
+        batch_size, seq_len = idx.shape
+        return to_tensor(np.zeros((batch_size, seq_len, self.n_embd), dtype=np.float32))
+
+
+class FakeLMHead:
+    def __init__(self, n_vocab: int):
+        self.n_vocab = n_vocab
+
+    def __call__(self, x):
+        batch_size = x.shape[0]
+        logits = np.zeros((batch_size, self.n_vocab), dtype=np.float32)
+        logits[:, 0] = 1.0
+        if self.n_vocab > 1:
+            logits[:, 1] = 0.5
+        return to_tensor(logits)
 
 
 def merge_heads(x):
@@ -420,6 +497,10 @@ class TestPagedTransformerLayer:
             n_embd=n_embd, n_head=n_head, block_size=block_size,
             p_dropout=0.0, backend=_test_backend,
         )
+        layer.ln_1 = IdentityProjection()
+        layer.ln_2 = IdentityProjection()
+        layer.attention = FakePagedAttentionModule(0.25, n_head, head_dim, block_size)
+        layer.ff = ScaleModule(0.5)
         block_manager = BlockManager(
             num_blocks=8, block_size=block_size,
             n_head=n_head, head_dim=head_dim,
@@ -443,6 +524,10 @@ class TestPagedTransformerLayer:
             n_embd=n_embd, n_head=n_head, block_size=block_size,
             p_dropout=0.0, backend=_test_backend,
         )
+        layer.ln_1 = IdentityProjection()
+        layer.ln_2 = IdentityProjection()
+        layer.attention = FakePagedAttentionModule(0.25, n_head, head_dim, block_size)
+        layer.ff = ScaleModule(0.5)
         block_manager = BlockManager(
             num_blocks=8, block_size=block_size,
             n_head=n_head, head_dim=head_dim,
@@ -468,6 +553,10 @@ class TestPagedTransformerLayer:
             n_embd=n_embd, n_head=n_head, block_size=block_size,
             p_dropout=0.0, backend=_test_backend,
         )
+        layer.ln_1 = IdentityProjection()
+        layer.ln_2 = IdentityProjection()
+        layer.attention = FakePagedAttentionModule(0.25, n_head, head_dim, block_size)
+        layer.ff = ScaleModule(0.5)
         block_manager = BlockManager(
             num_blocks=4, block_size=block_size,
             n_head=n_head, head_dim=head_dim,
@@ -498,6 +587,11 @@ class TestPagedDecoderLM:
             block_size=block_size, p_dropout=0.0,
             backend=_test_backend,
         )
+        model.token_embeddings = FakeTokenEmbedding(n_embd)
+        model.position_embeddings = FakePositionEmbedding(n_embd)
+        model.layers = [FakePagedAttentionModule(0.0, n_head, n_embd // n_head, block_size)]
+        model.ln = IdentityProjection()
+        model.lm_head = FakeLMHead(n_vocab)
         block_manager = BlockManager(
             num_blocks=16, block_size=block_size,
             n_head=n_head, head_dim=n_embd // n_head,
@@ -526,6 +620,11 @@ class TestPagedDecoderLM:
             block_size=block_size, p_dropout=0.0,
             backend=_test_backend,
         )
+        model.token_embeddings = FakeTokenEmbedding(n_embd)
+        model.position_embeddings = FakePositionEmbedding(n_embd)
+        model.layers = [FakePagedAttentionModule(0.0, n_head, n_embd // n_head, block_size)]
+        model.ln = IdentityProjection()
+        model.lm_head = FakeLMHead(n_vocab)
         block_manager = BlockManager(
             num_blocks=16, block_size=block_size,
             n_head=n_head, head_dim=n_embd // n_head,
