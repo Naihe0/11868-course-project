@@ -89,14 +89,32 @@ class PagedTransformerLayer(Module):
     def forward_prefill(self, x, block_manager: BlockManager, seq_ids: List[int]):
         """Prefill pass through a single transformer layer."""
         batch_size, seq_len, n_embd = x.shape
-        # TODO: Implement pre-LN transformer layer (prefill path)
-        raise NotImplementedError
+        # Pre-LN: LayerNorm → Attention → Residual
+        norm_x = self.ln_1(x.view(batch_size * seq_len, n_embd)).view(
+            batch_size, seq_len, n_embd
+        )
+        x = x + self.attention.forward_prefill(norm_x, block_manager, seq_ids)
+        # Pre-LN: LayerNorm → FeedForward → Residual
+        norm_x = self.ln_2(x.view(batch_size * seq_len, n_embd)).view(
+            batch_size, seq_len, n_embd
+        )
+        x = x + self.ff(norm_x)
+        return x
 
     def forward_decode(self, x, block_manager: BlockManager, seq_ids: List[int]):
         """Decode pass through a single transformer layer."""
         batch_size, seq_len, n_embd = x.shape
-        # TODO: Implement pre-LN transformer layer (decode path)
-        raise NotImplementedError
+        # Pre-LN: LayerNorm → Attention → Residual
+        norm_x = self.ln_1(x.view(batch_size * seq_len, n_embd)).view(
+            batch_size, seq_len, n_embd
+        )
+        x = x + self.attention.forward_decode(norm_x, block_manager, seq_ids)
+        # Pre-LN: LayerNorm → FeedForward → Residual
+        norm_x = self.ln_2(x.view(batch_size * seq_len, n_embd)).view(
+            batch_size, seq_len, n_embd
+        )
+        x = x + self.ff(norm_x)
+        return x
 
 
 # ---------------------------------------------------------------------------
@@ -261,10 +279,53 @@ class PagedDecoderLM(Module):
         Returns:
             Generated token indices (batch, prompt_len + max_new_tokens).
         """
-        # TODO: Implement generation loop
-        # Steps:
-        #   1. Prefill with prompt
-        #   2. Sample next token from logits
-        #   3. Decode loop: for each new token, call forward_decode
-        #   4. Free sequences when done
-        raise NotImplementedError
+        model.eval()
+        batch_size, prompt_len = idx.shape
+        generated = idx.to_numpy().tolist()  # list of lists
+
+        # 1. Prefill: process the full prompt
+        logits = model.forward_prefill(idx, block_manager, seq_ids)
+        # Take logits at the last prompt position
+        last_logits_np = logits.to_numpy()[:, -1, :]  # (batch, n_vocab)
+
+        # 2. Sample next token from last position logits
+        def _sample(logits_np: np.ndarray) -> np.ndarray:
+            """Temperature-scaled sampling. Returns (batch,) int array."""
+            if temperature <= 0:
+                return np.argmax(logits_np, axis=-1)
+            scaled = logits_np / temperature
+            scaled = scaled - np.max(scaled, axis=-1, keepdims=True)
+            probs = np.exp(scaled) / np.sum(np.exp(scaled), axis=-1, keepdims=True)
+            tokens = np.array([
+                np.random.choice(len(p), p=p) for p in probs
+            ])
+            return tokens
+
+        next_tokens = _sample(last_logits_np)  # (batch,)
+        for b in range(batch_size):
+            generated[b].append(int(next_tokens[b]))
+
+        # 3. Decode loop
+        for step in range(1, max_new_tokens):
+            # Build input tensor (batch, 1)
+            token_input = tensor_from_numpy(
+                next_tokens.reshape(batch_size, 1).astype(datatype),
+                backend=model.backend,
+            )
+            start_pos = prompt_len + step - 1
+            logits = model.forward_decode(
+                token_input, block_manager, seq_ids, start_pos=start_pos
+            )
+            logits_np = logits.to_numpy()[:, 0, :]  # (batch, n_vocab)
+            next_tokens = _sample(logits_np)
+            for b in range(batch_size):
+                generated[b].append(int(next_tokens[b]))
+
+        # 4. Free sequences
+        for seq_id in seq_ids:
+            block_manager.free_sequence(seq_id)
+
+        return tensor_from_numpy(
+            np.array(generated, dtype=datatype),
+            backend=model.backend,
+        )

@@ -7,7 +7,6 @@ Embedding
 """
 import numpy as np
 from math import sqrt
-from turtle import back
 from .module import Module, Parameter
 from .tensor_functions import (MatMul ,Add, Mul, PowerScalar ,zeros, ones, rand, tensor, tensor_from_numpy, zeros_tensor_from_numpy, ones_tensor_from_numpy)
 from .nn import one_hot

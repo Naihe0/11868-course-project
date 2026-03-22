@@ -1,0 +1,150 @@
+%%%%%%%% mlsys 2024 EXAMPLE LATEX SUBMISSION FILE %%%%%%%%%%%%%%%%%
+
+\documentclass{article}
+
+% Recommended, but optional, packages for figures and better typesetting:
+\usepackage{microtype}
+\usepackage{graphicx}
+\usepackage{subfigure}
+\usepackage{booktabs} % for professional tables
+\usepackage{amsmath}
+
+% hyperref makes hyperlinks in the resulting PDF.
+% If your build breaks (sometimes temporarily if a hyperlink spans a page)
+% please comment out the following usepackage line and replace
+% \usepackage{mlsys2024} with \usepackage[nohyperref]{mlsys2024} above.
+%%\usepackage{hyperref}
+
+% Attempt to make hyperref and algorithmic work together better:
+\newcommand{\theHalgorithm}{\arabic{algorithm}}
+
+% Use the following line for the initial blind version submitted for review:
+% \usepackage{mlsys2024}
+
+% If accepted, instead use the following line for the camera-ready submission:
+\usepackage[accepted]{mlsys2024}
+
+
+% The \mlsystitle you define below is probably too long as a header.
+% Therefore, a short form for the running title is supplied here:
+\mlsystitlerunning{Project Proposal: Reimplementing PagedAttention in MiniTorch}
+
+\begin{document}
+
+\twocolumn[
+\mlsystitle{Project Proposal: Reimplementing PagedAttention in MiniTorch}
+
+\mlsyssetsymbol{equal}{*}
+
+\begin{mlsysauthorlist}
+\mlsysauthor{NingRui Yang}{affil}
+\mlsysauthor{Yixiang Dai}{affil}
+\end{mlsysauthorlist}
+
+\mlsysaffiliation{affil}{ECE, Carnegie Mellon University, Pittsburgh, PA, US}
+
+\mlsyscorrespondingauthor{Student Name 1}{email@domain.com}
+
+\mlsyskeywords{Machine Learning, MLSys, PagedAttention, MiniTorch}
+
+\vskip 0.3in
+
+\begin{abstract}
+This project proposes to reimplement PagedAttention, a memory-efficient attention mechanism for Large Language Models (LLMs), within the MiniTorch framework. As LLMs scale, managing the Key-Value (KV) cache during inference becomes a significant memory bottleneck, leading to fragmentation and suboptimal GPU utilization. PagedAttention addresses this by managing the KV cache in non-contiguous memory blocks, inspired by virtual memory paging. By integrating this into MiniTorch, an educational deep learning framework, we aim to provide a clear, accessible implementation that demonstrates the system-level challenges and solutions in modern LLM serving.
+\end{abstract}
+
+\printAffiliationsAndNotice{}
+]
+
+\section{Problem Statement and System Challenges}
+\label{sec:problem}
+
+The primary problem we plan to address is the memory bottleneck caused by the Key-Value (KV) cache during Large Language Model (LLM) inference, specifically in autoregressive generation. 
+
+The system challenges include:
+\begin{itemize}
+    \item \textbf{Dynamic Memory Growth:} The KV cache grows dynamically with the sequence length as new tokens are generated, making its maximum size unpredictable at the start of a request.
+    \item \textbf{Memory Fragmentation:} Traditional implementations allocate contiguous memory for the maximum possible sequence length. Because the actual generation length is often much shorter, this leads to severe internal memory fragmentation. Furthermore, as requests finish and free their memory, external fragmentation occurs.
+    \item \textbf{Suboptimal GPU Utilization:} This fragmentation limits the batch size that can be served concurrently, as memory is wasted. Consequently, this reduces overall system throughput and GPU compute utilization.
+\end{itemize}
+
+\section{State-of-the-Art Methods}
+\label{sec:sota}
+
+The state-of-the-art method for addressing KV cache fragmentation is \textbf{PagedAttention}, introduced by Kwon et al. in the vLLM framework \cite{kwon2023efficient}.
+
+\begin{itemize}
+    \item PagedAttention divides the KV cache into fixed-size blocks (pages) that do not need to be contiguous in physical memory.
+    \item It uses a block table to map logical tokens to physical blocks, similar to how an operating system manages virtual memory.
+    \item \textbf{Availability:} The source code for vLLM and the PagedAttention CUDA kernels is open-source and available on GitHub. Other major serving frameworks, such as Hugging Face Text Generation Inference (TGI) and NVIDIA TensorRT-LLM, have also adopted similar paging mechanisms.
+\end{itemize}
+
+\section{Proposed Directions}
+\label{sec:directions}
+
+We plan to implement PagedAttention from scratch within the MiniTorch framework, which we have been using in the course assignments. The possible directions for going forward include:
+
+\begin{itemize}
+    \item \textbf{Memory Manager:} Develop a block-based memory allocator in MiniTorch to manage KV cache pages efficiently.
+    \item \textbf{PagedAttention Kernel:} Implement a custom CUDA kernel for PagedAttention that computes attention over non-contiguous memory blocks via the block table.
+    \item \textbf{Integration:} Integrate the PagedAttention mechanism into a simple transformer model built on top of MiniTorch.
+    \item \textbf{Optimization:} Explore optimizations such as block size tuning and efficient block table lookups to maximize throughput.
+\end{itemize}
+
+\section{Evaluation Plan}
+\label{sec:evaluation}
+
+We will evaluate the performance of our PagedAttention implementation against a baseline standard attention implementation in MiniTorch.
+
+\noindent\textbf{Metrics:}
+\begin{itemize}
+    \item \textbf{Throughput:} tokens/sec, reported separately for \textbf{prefill} and \textbf{decode}.
+    \item \textbf{Latency:} ms/token (p50/p95) for decode steps under churn.
+    \item \textbf{Peak KV memory:} maximum allocated KV bytes during a run.
+    \item \textbf{KV utilization:} $\text{util}=\frac{\text{used\_tokens}}{\text{num\_blocks}\times B}$.
+    \item \textbf{Max sustainable concurrency:} largest number of concurrent requests before OOM at fixed workload distribution.
+    \item \textbf{Correctness:} max absolute error and top-1 logit agreement vs reference attention.
+\end{itemize}
+
+\noindent\textbf{Workloads and baselines:}
+\begin{itemize}
+    \item \textbf{Workload:} We will simulate LLM inference workloads with varying prompt lengths and generation lengths. We plan to use synthetic datasets or sample prompts from datasets like ShareGPT to mimic real-world request distributions.
+    \item \textbf{Baselines:} MiniTorch standard attention with contiguous KV allocation; optional blocked KV without page table to isolate indirection cost.
+\end{itemize}
+
+\section{Team and Workload Distribution}
+\label{sec:team}
+
+Our team consists of 2 members. We plan to split the workload as follows:
+\begin{itemize}
+    \item \textbf{NingRui Yang:} Focus on the memory manager, block allocator implementation, and integration with the MiniTorch transformer.
+    \item \textbf{Yixiang Dai:} Focus on the CUDA kernel implementation for PagedAttention and developing the evaluation scripts.
+\end{itemize}
+\textit{(Note: Both members will collaborate on the literature review, debugging, and final report writing.)}
+
+\section{Timeline and Milestones}
+\label{sec:timeline}
+
+A rough timeline for the project is as follows:
+\begin{itemize}
+    \item \textbf{Week 1:} Literature review, understanding vLLM's PagedAttention implementation, and designing the MiniTorch integration.
+    \item \textbf{Week 2-3:} Implementing the block memory manager and basic data structures.
+    \item \textbf{Week 4-5:} Developing and testing the PagedAttention CUDA kernel.
+    \item \textbf{Week 6:} Integrating the kernel into the MiniTorch transformer model and initial testing.
+    \item \textbf{Week 7:} Performance evaluation, benchmarking, and final report writing.
+\end{itemize}
+
+\section{Resource Requirements}
+\label{sec:resources}
+
+To successfully complete this project, we will utilize the provided Pittsburgh Supercomputing Center (PSC) resources. Specifically, we will need:
+\begin{itemize}
+    \item \textbf{GPU:} Access to the provided V100 GPU compute nodes (either V100-16GB or V100-32GB) to test the CUDA kernel and measure memory utilization effectively. We plan to use a single GPU for most of our development and testing to avoid excessive resource consumption.
+    \item \textbf{CPU and Storage:} Standard CPU and storage available on the PSC nodes for development and dataset storage.
+    \item \textbf{Computation Time:} We estimate requiring approximately 40-50 GPU hours for development, debugging, and running comprehensive benchmarks. We will ensure our jobs are well-scoped to share resources fairly with the rest of the class.
+\end{itemize}
+
+\bibliography{example_paper}
+\bibliographystyle{mlsys2024}
+
+\end{document}

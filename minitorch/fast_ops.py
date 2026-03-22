@@ -128,6 +128,24 @@ class FastOps(TensorOps):
             out = out.view(out.shape[1], out.shape[2])
         return out
 
+    @staticmethod
+    def attn_softmax_fw(inp, mask):
+        raise NotImplementedError("Not implemented for FastOps")
+
+    @staticmethod
+    def attn_softmax_bw():
+        raise NotImplementedError("Not implemented for FastOps")
+
+    @staticmethod
+    def layernorm_fw(inp):
+        raise NotImplementedError("Not implemented for FastOps")
+
+    @staticmethod
+    def layernorm_bw():
+        raise NotImplementedError("Not implemented for FastOps")
+
+    is_cuda = False
+
 
 # Implementations
 

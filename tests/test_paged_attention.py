@@ -25,11 +25,14 @@ from minitorch.paged_attention import (
     PagedMultiHeadAttention,
 )
 from minitorch.tensor_functions import tensor_from_numpy
-from minitorch.tensor_ops import SimpleBackend
+from minitorch.tensor_ops import TensorBackend, SimpleBackend
+from minitorch.fast_ops import FastOps
+
+_test_backend = TensorBackend(FastOps)
 
 
 def to_tensor(x: np.ndarray):
-    return tensor_from_numpy(x.astype(np.float32), backend=SimpleBackend)
+    return tensor_from_numpy(x.astype(np.float32), backend=_test_backend)
 
 
 def causal_mask(seq_q: int, seq_kv: int):
@@ -106,7 +109,7 @@ def rng():
 
 @pytest.fixture
 def default_config():
-    return dict(n_head=4, head_dim=16, block_size=4)
+    return dict(n_head=2, head_dim=4, block_size=4)
 
 
 # ---------------------------------------------------------------------------
@@ -314,7 +317,7 @@ class TestPagedMultiHeadAttention:
             n_embd=n_embd,
             n_head=n_head,
             block_size=block_size,
-            backend=SimpleBackend,
+            backend=_test_backend,
         )
         module.q_proj = IdentityProjection()
         module.k_proj = IdentityProjection()
@@ -361,7 +364,7 @@ class TestPagedMultiHeadAttention:
             n_embd=n_embd,
             n_head=n_head,
             block_size=block_size,
-            backend=SimpleBackend,
+            backend=_test_backend,
         )
         module.q_proj = IdentityProjection()
         module.k_proj = IdentityProjection()
@@ -396,6 +399,145 @@ class TestPagedMultiHeadAttention:
         assert block_manager.block_tables[seq_id].block_ids == [0, 1]
         np.testing.assert_allclose(block_manager.key_cache[1, 0], decode_heads[0, :, 0, :])
         np.testing.assert_allclose(block_manager.value_cache[1, 0], decode_heads[0, :, 0, :])
+
+
+# ---------------------------------------------------------------------------
+# PagedTransformerLayer tests
+# ---------------------------------------------------------------------------
+
+class TestPagedTransformerLayer:
+    def test_prefill_output_shape(self, rng):
+        """Prefill should return (batch, seq_len, n_embd)."""
+        from minitorch.transformer import PagedTransformerLayer
+        n_head = 2
+        head_dim = 3
+        n_embd = n_head * head_dim
+        block_size = 2
+        seq_len = 3
+        batch_size = 1
+
+        layer = PagedTransformerLayer(
+            n_embd=n_embd, n_head=n_head, block_size=block_size,
+            p_dropout=0.0, backend=_test_backend,
+        )
+        block_manager = BlockManager(
+            num_blocks=8, block_size=block_size,
+            n_head=n_head, head_dim=head_dim,
+        )
+        x_np = rng.standard_normal((batch_size, seq_len, n_embd), dtype=np.float32)
+        x = to_tensor(x_np)
+
+        output = layer.forward_prefill(x, block_manager, [0])
+        assert output.shape == (batch_size, seq_len, n_embd)
+
+    def test_decode_output_shape(self, rng):
+        """Decode should return (batch, 1, n_embd) after prefill."""
+        from minitorch.transformer import PagedTransformerLayer
+        n_head = 2
+        head_dim = 3
+        n_embd = n_head * head_dim
+        block_size = 2
+        batch_size = 1
+
+        layer = PagedTransformerLayer(
+            n_embd=n_embd, n_head=n_head, block_size=block_size,
+            p_dropout=0.0, backend=_test_backend,
+        )
+        block_manager = BlockManager(
+            num_blocks=8, block_size=block_size,
+            n_head=n_head, head_dim=head_dim,
+        )
+        # Prefill first
+        prompt_np = rng.standard_normal((batch_size, 2, n_embd), dtype=np.float32)
+        layer.forward_prefill(to_tensor(prompt_np), block_manager, [0])
+
+        # Decode
+        decode_np = rng.standard_normal((batch_size, 1, n_embd), dtype=np.float32)
+        output = layer.forward_decode(to_tensor(decode_np), block_manager, [0])
+        assert output.shape == (batch_size, 1, n_embd)
+
+    def test_prefill_residual_connection(self, rng):
+        """Output should differ from input (attention + ff applied) but have same shape."""
+        from minitorch.transformer import PagedTransformerLayer
+        n_head = 2
+        head_dim = 3
+        n_embd = n_head * head_dim
+        block_size = 4
+
+        layer = PagedTransformerLayer(
+            n_embd=n_embd, n_head=n_head, block_size=block_size,
+            p_dropout=0.0, backend=_test_backend,
+        )
+        block_manager = BlockManager(
+            num_blocks=4, block_size=block_size,
+            n_head=n_head, head_dim=head_dim,
+        )
+        x_np = rng.standard_normal((1, 3, n_embd), dtype=np.float32)
+        x = to_tensor(x_np)
+        output = layer.forward_prefill(x, block_manager, [0])
+        # Output should not be identical to input (non-trivial transform)
+        assert not np.allclose(output.to_numpy(), x_np, atol=1e-3)
+
+
+class TestPagedDecoderLM:
+    def test_generate_output_shape(self, rng):
+        """Generate should produce (batch, prompt_len + max_new_tokens) tokens."""
+        from minitorch.transformer import PagedDecoderLM
+        n_vocab = 10
+        n_embd = 6
+        n_head = 2
+        n_positions = 16
+        n_layers = 1
+        block_size = 4
+        prompt_len = 3
+        max_new_tokens = 2
+
+        model = PagedDecoderLM(
+            n_vocab=n_vocab, n_embd=n_embd, n_head=n_head,
+            n_positions=n_positions, n_layers=n_layers,
+            block_size=block_size, p_dropout=0.0,
+            backend=_test_backend,
+        )
+        block_manager = BlockManager(
+            num_blocks=16, block_size=block_size,
+            n_head=n_head, head_dim=n_embd // n_head,
+        )
+        idx_np = rng.integers(0, n_vocab, size=(1, prompt_len)).astype(np.float32)
+        idx = to_tensor(idx_np)
+
+        result = PagedDecoderLM.generate(
+            model, idx, max_new_tokens, block_manager, [0], temperature=1.0,
+        )
+        assert result.shape == (1, prompt_len + max_new_tokens)
+
+    def test_generate_frees_sequences(self, rng):
+        """After generate, the block manager should have freed the sequence."""
+        from minitorch.transformer import PagedDecoderLM
+        n_vocab = 10
+        n_embd = 6
+        n_head = 2
+        n_positions = 16
+        n_layers = 1
+        block_size = 4
+
+        model = PagedDecoderLM(
+            n_vocab=n_vocab, n_embd=n_embd, n_head=n_head,
+            n_positions=n_positions, n_layers=n_layers,
+            block_size=block_size, p_dropout=0.0,
+            backend=_test_backend,
+        )
+        block_manager = BlockManager(
+            num_blocks=16, block_size=block_size,
+            n_head=n_head, head_dim=n_embd // n_head,
+        )
+        idx_np = rng.integers(0, n_vocab, size=(1, 2)).astype(np.float32)
+        idx = to_tensor(idx_np)
+
+        PagedDecoderLM.generate(
+            model, idx, 2, block_manager, [42], temperature=1.0,
+        )
+        # Sequence should be freed
+        assert 42 not in block_manager.block_tables
 
 
 # ---------------------------------------------------------------------------
