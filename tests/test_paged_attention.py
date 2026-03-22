@@ -22,6 +22,7 @@ from minitorch.paged_attention import (
     standard_attention,
     paged_attention_ref,
     PagedAttentionKernel,
+    PagedMultiHeadAttention,
 )
 from minitorch.tensor_functions import tensor_from_numpy
 from minitorch.tensor_ops import SimpleBackend
@@ -74,6 +75,16 @@ def build_paged_cache(
         block_tables.append(seq_block_ids)
 
     return key_cache, value_cache, block_tables
+
+
+class IdentityProjection:
+    def __call__(self, x):
+        return x
+
+
+def merge_heads(x):
+    batch, n_head, seq_len, head_dim = x.shape
+    return np.transpose(x, (0, 2, 1, 3)).reshape(batch, seq_len, n_head * head_dim)
 
 
 def _cuda_available() -> bool:
@@ -288,6 +299,103 @@ class TestPagedVsStandard:
                 atol=1e-5,
                 rtol=1e-5,
             )
+
+
+class TestPagedMultiHeadAttention:
+    def test_forward_prefill_populates_cache(self, rng):
+        n_head = 2
+        head_dim = 3
+        n_embd = n_head * head_dim
+        block_size = 2
+        seq_len = 3
+        seq_id = 11
+
+        module = PagedMultiHeadAttention(
+            n_embd=n_embd,
+            n_head=n_head,
+            block_size=block_size,
+            backend=SimpleBackend,
+        )
+        module.q_proj = IdentityProjection()
+        module.k_proj = IdentityProjection()
+        module.v_proj = IdentityProjection()
+        module.out_proj = IdentityProjection()
+
+        x_np = rng.standard_normal((1, seq_len, n_embd), dtype=np.float32)
+        x = to_tensor(x_np)
+        block_manager = BlockManager(
+            num_blocks=4,
+            block_size=block_size,
+            n_head=n_head,
+            head_dim=head_dim,
+        )
+
+        output = module.forward_prefill(x, block_manager, [seq_id])
+
+        qkv_np = np.transpose(
+            x_np.reshape(1, seq_len, n_head, head_dim),
+            (0, 2, 1, 3),
+        )
+        mask = np.triu(
+            np.full((1, 1, seq_len, seq_len), -1e9, dtype=np.float32),
+            k=1,
+        )
+        expected = merge_heads(manual_attention(qkv_np, qkv_np, qkv_np, mask))
+
+        np.testing.assert_allclose(output.to_numpy(), expected, atol=1e-5, rtol=1e-5)
+        assert block_manager.context_lens[seq_id] == seq_len
+        assert block_manager.block_tables[seq_id].block_ids == [0, 1]
+        np.testing.assert_allclose(block_manager.key_cache[0, :2], qkv_np[0, :, :2, :].transpose(1, 0, 2))
+        np.testing.assert_allclose(block_manager.key_cache[1, :1], qkv_np[0, :, 2:3, :].transpose(1, 0, 2))
+        np.testing.assert_allclose(block_manager.value_cache[0, :2], qkv_np[0, :, :2, :].transpose(1, 0, 2))
+        np.testing.assert_allclose(block_manager.value_cache[1, :1], qkv_np[0, :, 2:3, :].transpose(1, 0, 2))
+
+    def test_forward_decode_appends_and_reads_cache(self, rng):
+        n_head = 2
+        head_dim = 3
+        n_embd = n_head * head_dim
+        block_size = 2
+        seq_id = 23
+
+        module = PagedMultiHeadAttention(
+            n_embd=n_embd,
+            n_head=n_head,
+            block_size=block_size,
+            backend=SimpleBackend,
+        )
+        module.q_proj = IdentityProjection()
+        module.k_proj = IdentityProjection()
+        module.v_proj = IdentityProjection()
+        module.out_proj = IdentityProjection()
+
+        prompt_np = rng.standard_normal((1, 2, n_embd), dtype=np.float32)
+        decode_np = rng.standard_normal((1, 1, n_embd), dtype=np.float32)
+        block_manager = BlockManager(
+            num_blocks=4,
+            block_size=block_size,
+            n_head=n_head,
+            head_dim=head_dim,
+        )
+
+        module.forward_prefill(to_tensor(prompt_np), block_manager, [seq_id])
+        output = module.forward_decode(to_tensor(decode_np), block_manager, [seq_id])
+
+        prompt_heads = np.transpose(
+            prompt_np.reshape(1, 2, n_head, head_dim),
+            (0, 2, 1, 3),
+        )
+        decode_heads = np.transpose(
+            decode_np.reshape(1, 1, n_head, head_dim),
+            (0, 2, 1, 3),
+        )
+        full_kv = np.concatenate([prompt_heads, decode_heads], axis=2)
+        expected = merge_heads(manual_attention(decode_heads, full_kv, full_kv))
+
+        np.testing.assert_allclose(output.to_numpy(), expected, atol=1e-5, rtol=1e-5)
+        assert block_manager.context_lens[seq_id] == 3
+        assert block_manager.block_tables[seq_id].block_ids == [0, 1]
+        np.testing.assert_allclose(block_manager.key_cache[1, 0], decode_heads[0, :, 0, :])
+        np.testing.assert_allclose(block_manager.value_cache[1, 0], decode_heads[0, :, 0, :])
 
 
 # ---------------------------------------------------------------------------

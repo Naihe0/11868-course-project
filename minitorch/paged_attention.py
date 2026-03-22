@@ -15,7 +15,7 @@ from .tensor import Tensor, tensor, tensor_from_numpy
 from .tensor_ops import TensorBackend
 from .nn import softmax
 from .block_manager import BlockManager, BlockTable, KVBlock, DEFAULT_BLOCK_SIZE
-
+from .modules_basic import Linear
 datatype = np.float32
 
 
@@ -210,6 +210,10 @@ class PagedMultiHeadAttention(Module):
         #       (reuse modules_basic.Linear)
 
         # CUDA kernel handle (lazy-loaded)
+        self.q_proj = Linear(n_embd, n_embd, bias=bias, backend=backend)
+        self.k_proj = Linear(n_embd, n_embd, bias=bias, backend=backend)
+        self.v_proj = Linear(n_embd, n_embd, bias=bias, backend=backend)
+        self.out_proj = Linear(n_embd, n_embd, bias=bias, backend=backend)
         self._kernel: Optional[PagedAttentionKernel] = None
 
     # ----- Forward (prefill — standard attention) --------------------------
@@ -231,13 +235,48 @@ class PagedMultiHeadAttention(Module):
         Returns:
             Output tensor (batch, seq_len, n_embd).
         """
-        # TODO: Implement prefill
-        # Steps:
-        #   1. Project x -> Q, K, V
-        #   2. Compute standard causal attention
-        #   3. Write K, V into block manager's cache
-        #   4. Return output
-        raise NotImplementedError
+        batch_size, seq_len, _ = x.shape
+        flat_x = x.contiguous().view(batch_size * seq_len, self.n_embd)
+
+        q = self.q_proj(flat_x).view(batch_size, seq_len, self.n_head, self.head_dim)
+        k = self.k_proj(flat_x).view(batch_size, seq_len, self.n_head, self.head_dim)
+        v = self.v_proj(flat_x).view(batch_size, seq_len, self.n_head, self.head_dim)
+
+        q = q.permute(0, 2, 1, 3)
+        k = k.permute(0, 2, 1, 3)
+        v = v.permute(0, 2, 1, 3)
+
+        mask_np = np.triu(
+            np.full((seq_len, seq_len), -1e9, dtype=datatype),
+            k=1,
+        ).reshape(1, 1, seq_len, seq_len)
+        mask = tensor_from_numpy(mask_np, backend=x.backend)
+
+        output = standard_attention(q, k, v, mask)
+        output = output.permute(0, 2, 1, 3).contiguous().view(
+            batch_size * seq_len, self.n_embd
+        )
+        output = self.out_proj(output).view(batch_size, seq_len, self.n_embd)
+
+        k_cache_values = k.permute(0, 2, 1, 3).to_numpy()
+        v_cache_values = v.permute(0, 2, 1, 3).to_numpy()
+
+        for batch_idx, seq_id in enumerate(seq_ids):
+            block_table = block_manager.allocate_blocks_for_sequence(seq_id, seq_len)
+
+            for logical_block_idx, block_id in enumerate(block_table.block_ids):
+                block = block_manager.blocks[block_id]
+                start = logical_block_idx * self.block_size
+                end = start + block.num_filled
+
+                block_manager.key_cache[block_id, : block.num_filled, :, :] = (
+                    k_cache_values[batch_idx, start:end, :, :]
+                )
+                block_manager.value_cache[block_id, : block.num_filled, :, :] = (
+                    v_cache_values[batch_idx, start:end, :, :]
+                )
+
+        return output
 
     # ----- Forward (decode — paged attention) ------------------------------
 
@@ -257,11 +296,46 @@ class PagedMultiHeadAttention(Module):
         Returns:
             Output tensor (batch, 1, n_embd).
         """
-        # TODO: Implement decode with paged attention
-        # Steps:
-        #   1. Project x -> Q, K_new, V_new
-        #   2. Append K_new, V_new to block manager
-        #   3. Gather block tables and context lengths
-        #   4. Call PagedAttention kernel (or ref implementation)
-        #   5. Return output
-        raise NotImplementedError
+        batch_size, seq_len, _ = x.shape
+        if seq_len != 1:
+            raise ValueError("forward_decode expects a single new token per sequence")
+
+        flat_x = x.contiguous().view(batch_size * seq_len, self.n_embd)
+        q = self.q_proj(flat_x).view(batch_size, seq_len, self.n_head, self.head_dim)
+        k = self.k_proj(flat_x).view(batch_size, seq_len, self.n_head, self.head_dim)
+        v = self.v_proj(flat_x).view(batch_size, seq_len, self.n_head, self.head_dim)
+
+        q = q.permute(0, 2, 1, 3)
+        k = k.permute(0, 2, 1, 3)
+        v = v.permute(0, 2, 1, 3)
+
+        k_new = k.permute(0, 2, 1, 3).to_numpy()[:, 0, :, :]
+        v_new = v.permute(0, 2, 1, 3).to_numpy()[:, 0, :, :]
+
+        for batch_idx, seq_id in enumerate(seq_ids):
+            if seq_id not in block_manager.block_tables:
+                block_manager.allocate_blocks_for_sequence(seq_id, 0)
+            block_manager.write_token_kv(seq_id, k_new[batch_idx], v_new[batch_idx])
+
+        block_tables = [
+            block_manager.block_tables[seq_id].block_ids for seq_id in seq_ids
+        ]
+        context_lens = [
+            block_manager.get_context_len(seq_id) for seq_id in seq_ids
+        ]
+
+        output = paged_attention_ref(
+            q,
+            block_manager.key_cache,
+            block_manager.value_cache,
+            block_tables,
+            context_lens,
+            block_size=self.block_size,
+            n_head=self.n_head,
+            head_dim=self.head_dim,
+        )
+        output = output.permute(0, 2, 1, 3).contiguous().view(
+            batch_size * seq_len, self.n_embd
+        )
+        output = self.out_proj(output).view(batch_size, seq_len, self.n_embd)
+        return output
