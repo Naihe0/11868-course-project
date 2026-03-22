@@ -144,13 +144,13 @@ python project/run_benchmark.py --batch-sizes 1 2 4 8 --seq-lengths 128 256 512 
 
 ### Attention implementation
 
-- [ ] Implement `standard_attention()` as the contiguous correctness baseline
-- [ ] Implement `paged_attention_ref()` for Python-side validation
+- [x] Implement `standard_attention()` as the contiguous correctness baseline
+- [x] Implement `paged_attention_ref()` for Python-side validation
 - [ ] Implement `PagedAttentionKernel._load_library()`
 - [ ] Implement `PagedAttentionKernel.forward()`
-- [ ] Initialize Q / K / V / output projections in `PagedMultiHeadAttention`
-- [ ] Implement `PagedMultiHeadAttention.forward_prefill()`
-- [ ] Implement `PagedMultiHeadAttention.forward_decode()`
+- [x] Initialize Q / K / V / output projections in `PagedMultiHeadAttention`
+- [x] Implement `PagedMultiHeadAttention.forward_prefill()`
+- [x] Implement `PagedMultiHeadAttention.forward_decode()`
 
 ### Transformer integration
 
@@ -185,7 +185,7 @@ python project/run_benchmark.py --batch-sizes 1 2 4 8 --seq-lengths 128 256 512 
 ### Tests
 
 - [x] Fill in `tests/test_block_manager.py`
-- [ ] Fill in `tests/test_paged_attention.py`
+- [x] Fill in `tests/test_paged_attention.py`
 - [ ] Fill in the remaining performance cycle test in `tests/test_benchmark.py`
 - [ ] Add an end-to-end inference smoke test once the model path is runnable
 
