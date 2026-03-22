@@ -7,6 +7,8 @@ allowing efficient memory utilization during LLM inference.
 
 from __future__ import annotations
 
+import ctypes
+import os
 import numpy as np
 from typing import Dict, List, Optional, Tuple
 
@@ -137,10 +139,47 @@ class PagedAttentionKernel:
         self.library_path = library_path
         self._lib = None
 
+    @staticmethod
+    def _to_numpy(value, dtype):
+        if isinstance(value, Tensor):
+            array = value.to_numpy()
+        else:
+            array = np.asarray(value)
+        return np.ascontiguousarray(array.astype(dtype, copy=False))
+
     def _load_library(self):
         """Load the compiled CUDA shared library."""
-        # TODO: Load .so using ctypes
-        raise NotImplementedError
+        if self._lib is not None:
+            return self._lib
+
+        library_path = self.library_path
+        if not os.path.isabs(library_path):
+            project_root = os.path.dirname(os.path.dirname(__file__))
+            library_path = os.path.join(project_root, library_path)
+
+        if not os.path.exists(library_path):
+            raise FileNotFoundError(
+                f"PagedAttention CUDA library not found: {library_path}"
+            )
+
+        lib = ctypes.CDLL(library_path)
+        lib.paged_attention_forward.argtypes = [
+            np.ctypeslib.ndpointer(dtype=datatype, flags="C_CONTIGUOUS"),
+            np.ctypeslib.ndpointer(dtype=datatype, flags="C_CONTIGUOUS"),
+            np.ctypeslib.ndpointer(dtype=datatype, flags="C_CONTIGUOUS"),
+            np.ctypeslib.ndpointer(dtype=datatype, flags="C_CONTIGUOUS"),
+            np.ctypeslib.ndpointer(dtype=np.int32, flags="C_CONTIGUOUS"),
+            np.ctypeslib.ndpointer(dtype=np.int32, flags="C_CONTIGUOUS"),
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_int,
+        ]
+        lib.paged_attention_forward.restype = None
+        self._lib = lib
+        return self._lib
 
     def forward(
         self,
@@ -166,8 +205,53 @@ class PagedAttentionKernel:
         Returns:
             Attention output (batch, n_head, head_dim).
         """
-        # TODO: Call into CUDA kernel
-        raise NotImplementedError
+        lib = self._load_library()
+
+        query_np = self._to_numpy(query, datatype)
+        original_query_rank = query_np.ndim
+        if original_query_rank == 4:
+            if query_np.shape[2] != 1:
+                raise ValueError("Kernel wrapper only supports decode queries with seq_len == 1")
+            query_np = query_np[:, :, 0, :]
+        elif query_np.ndim != 3:
+            raise ValueError("Query must have shape (batch, n_head, head_dim) or (batch, n_head, 1, head_dim)")
+
+        key_cache_np = self._to_numpy(key_cache, datatype)
+        value_cache_np = self._to_numpy(value_cache, datatype)
+        block_tables_np = self._to_numpy(block_tables, np.int32)
+        context_lens_np = self._to_numpy(context_lens, np.int32).reshape(-1)
+
+        batch_size, n_head, head_dim = query_np.shape
+        if key_cache_np.shape[1] != block_size:
+            raise ValueError("key_cache shape does not match block_size")
+        if value_cache_np.shape != key_cache_np.shape:
+            raise ValueError("value_cache must have the same shape as key_cache")
+        if block_tables_np.shape[0] != batch_size:
+            raise ValueError("block_tables batch dimension must match query batch size")
+        if context_lens_np.shape[0] != batch_size:
+            raise ValueError("context_lens length must match query batch size")
+
+        max_blocks_per_seq = block_tables_np.shape[1] if block_tables_np.ndim == 2 else 0
+        output_np = np.zeros((batch_size, n_head, head_dim), dtype=datatype)
+
+        lib.paged_attention_forward(
+            output_np,
+            query_np,
+            key_cache_np,
+            value_cache_np,
+            block_tables_np,
+            context_lens_np,
+            batch_size,
+            n_head,
+            head_dim,
+            block_size,
+            max_blocks_per_seq,
+            max_context_len,
+        )
+
+        if original_query_rank == 4:
+            output_np = output_np.reshape(batch_size, n_head, 1, head_dim)
+        return tensor_from_numpy(output_np.astype(datatype), backend=query.backend)
 
 
 # ---------------------------------------------------------------------------
