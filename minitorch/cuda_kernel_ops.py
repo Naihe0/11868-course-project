@@ -18,15 +18,29 @@ from .tensor_functions import tensor_from_numpy
 
 import ctypes
 import numpy as np
-import pycuda.autoinit
-import pycuda.driver as cuda
 import torch
 
-# Load the shared library
-lib = ctypes.CDLL("minitorch/cuda_kernels/combine.so")
-lib_softmax = ctypes.CDLL("minitorch/cuda_kernels/softmax_kernel.so")
-lib_layernorm = ctypes.CDLL("minitorch/cuda_kernels/layernorm_kernel.so")
+try:
+    import pycuda.autoinit  # noqa: F401
+    import pycuda.driver as cuda
+    _PYCUDA_AVAILABLE = True
+except Exception:
+    _PYCUDA_AVAILABLE = False
+
 datatype = np.float32
+
+try:
+    lib = ctypes.CDLL("minitorch/cuda_kernels/combine.so")
+except OSError:
+    lib = None
+try:
+    lib_softmax = ctypes.CDLL("minitorch/cuda_kernels/softmax_kernel.so")
+except OSError:
+    lib_softmax = None
+try:
+    lib_layernorm = ctypes.CDLL("minitorch/cuda_kernels/layernorm_kernel.so")
+except OSError:
+    lib_layernorm = None
 
 # function map
 fn_map = {
