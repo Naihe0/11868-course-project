@@ -1,6 +1,18 @@
 # MiniTorch v0.5 - PagedAttention Project
 #
 # Base modules (copied from hw3)
+
+# Initialise the CUDA *runtime* API (via PyTorch) before numba.cuda creates a
+# driver-API context.  If numba's driver context is established first, the
+# CUDA runtime can no longer enumerate devices, causing cudaSetDevice /
+# cudaMalloc / etc. to fail with "no CUDA-capable device is detected".
+try:
+    import torch
+    if torch.cuda.is_available():
+        torch.cuda.init()
+except Exception:
+    pass
+
 import minitorch.scalar_functions as scalar_functions  # noqa: F401,F403
 
 from .autodiff import *  # noqa: F401,F403

@@ -175,6 +175,23 @@ def _cuda_available() -> bool:
         return False
 
 
+def _kernel_available() -> bool:
+    """Check if the compiled PagedAttention .so exists and a CUDA GPU is present."""
+    import os
+    so_path = os.path.join(
+        os.path.dirname(os.path.dirname(__file__)),
+        "minitorch", "cuda_kernels", "paged_attention.so",
+    )
+    if not os.path.exists(so_path):
+        return False
+    try:
+        import ctypes
+        ctypes.CDLL(so_path)
+        return True
+    except OSError:
+        return False
+
+
 # ---------------------------------------------------------------------------
 # Fixtures
 # ---------------------------------------------------------------------------
@@ -644,14 +661,97 @@ class TestPagedDecoderLM:
 # ---------------------------------------------------------------------------
 
 @pytest.mark.skipif(
-    not _cuda_available(),
-    reason="CUDA not available",
+    not _kernel_available(),
+    reason="PagedAttention .so not available (compile with compile_cuda.sh)",
 )
-@pytest.mark.skip(reason="PagedAttention CUDA kernel wrapper not implemented yet")
 class TestPagedAttentionKernel:
     def test_kernel_matches_reference(self, rng, default_config):
         """CUDA kernel output should match Python reference implementation."""
-        raise NotImplementedError
+        n_head = default_config["n_head"]
+        head_dim = default_config["head_dim"]
+        block_size = default_config["block_size"]
+        seq_len = 7
+
+        query_np = rng.standard_normal((1, n_head, 1, head_dim), dtype=np.float32)
+        keys_np = rng.standard_normal((seq_len, n_head, head_dim), dtype=np.float32)
+        values_np = rng.standard_normal((seq_len, n_head, head_dim), dtype=np.float32)
+
+        key_cache, value_cache, block_tables = build_paged_cache(
+            [keys_np], [values_np], block_size,
+        )
+        # Python reference
+        ref_out = paged_attention_ref(
+            to_tensor(query_np),
+            key_cache, value_cache, block_tables,
+            [seq_len],
+            block_size=block_size, n_head=n_head, head_dim=head_dim,
+        )
+
+        # CUDA kernel
+        kernel = PagedAttentionKernel()
+        kernel_out = kernel.forward(
+            to_tensor(query_np),
+            to_tensor(key_cache),
+            to_tensor(value_cache),
+            to_tensor(np.array(block_tables, dtype=np.int32)),
+            to_tensor(np.array([seq_len], dtype=np.int32)),
+            block_size=block_size,
+            max_context_len=seq_len,
+        )
+
+        np.testing.assert_allclose(
+            kernel_out.to_numpy(), ref_out.to_numpy(), atol=1e-4, rtol=1e-4,
+        )
 
     def test_kernel_batch(self, rng, default_config):
-        raise NotImplementedError
+        """CUDA kernel should handle batched sequences with different lengths."""
+        n_head = default_config["n_head"]
+        head_dim = default_config["head_dim"]
+        block_size = default_config["block_size"]
+        seq_lens = [3, 7, 5]
+        batch_size = len(seq_lens)
+
+        query_np = rng.standard_normal(
+            (batch_size, n_head, 1, head_dim), dtype=np.float32,
+        )
+        keys_by_seq = [
+            rng.standard_normal((sl, n_head, head_dim), dtype=np.float32)
+            for sl in seq_lens
+        ]
+        values_by_seq = [
+            rng.standard_normal((sl, n_head, head_dim), dtype=np.float32)
+            for sl in seq_lens
+        ]
+
+        key_cache, value_cache, block_tables = build_paged_cache(
+            keys_by_seq, values_by_seq, block_size,
+        )
+
+        # Python reference
+        ref_out = paged_attention_ref(
+            to_tensor(query_np),
+            key_cache, value_cache, block_tables,
+            seq_lens,
+            block_size=block_size, n_head=n_head, head_dim=head_dim,
+        )
+
+        # Pad block_tables to uniform width for the kernel
+        max_blocks = max(len(bt) for bt in block_tables)
+        padded_tables = np.zeros((batch_size, max_blocks), dtype=np.int32)
+        for i, bt in enumerate(block_tables):
+            padded_tables[i, :len(bt)] = bt
+
+        kernel = PagedAttentionKernel()
+        kernel_out = kernel.forward(
+            to_tensor(query_np),
+            to_tensor(key_cache),
+            to_tensor(value_cache),
+            to_tensor(padded_tables),
+            to_tensor(np.array(seq_lens, dtype=np.int32)),
+            block_size=block_size,
+            max_context_len=max(seq_lens),
+        )
+
+        np.testing.assert_allclose(
+            kernel_out.to_numpy(), ref_out.to_numpy(), atol=1e-4, rtol=1e-4,
+        )
