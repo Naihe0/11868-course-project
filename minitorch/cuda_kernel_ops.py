@@ -20,12 +20,26 @@ import ctypes
 import numpy as np
 import torch
 
-try:
-    import pycuda.autoinit  # noqa: F401
-    import pycuda.driver as cuda
-    _PYCUDA_AVAILABLE = True
-except Exception:
-    _PYCUDA_AVAILABLE = False
+# PyCUDA is imported lazily (inside functions that need it) to avoid
+# poisoning the CUDA runtime API for other libraries that use cudaMalloc etc.
+_PYCUDA_AVAILABLE = False
+_pycuda_cuda = None  # set to pycuda.driver when first needed
+
+
+def _ensure_pycuda():
+    """Lazily import and initialise PyCUDA."""
+    global _PYCUDA_AVAILABLE, _pycuda_cuda
+    if _pycuda_cuda is not None:
+        return _pycuda_cuda
+    try:
+        import pycuda.autoinit  # noqa: F401
+        import pycuda.driver as _cuda
+        _pycuda_cuda = _cuda
+        _PYCUDA_AVAILABLE = True
+        return _pycuda_cuda
+    except Exception:
+        _PYCUDA_AVAILABLE = False
+        return None
 
 datatype = np.float32
 
@@ -209,6 +223,9 @@ class CudaKernelOps(TensorOps):
 
     @staticmethod
     def matrix_multiply_cublas(a: Tensor, b: Tensor) -> Tensor:
+        cuda = _ensure_pycuda()
+        if cuda is None:
+            raise RuntimeError("PyCUDA is not available; cannot run matrix_multiply_cublas")
         both_2d = 0
         if len(a.shape) == 2:
             a = a.contiguous().view(1, a.shape[0], a.shape[1])

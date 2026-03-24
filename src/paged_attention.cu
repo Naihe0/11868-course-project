@@ -42,12 +42,18 @@
 // ---------------------------------------------------------------------------
 
 __device__ float warp_reduce_sum(float val) {
-    // TODO: Implement warp-level sum reduction using __shfl_xor_sync
+    #pragma unroll
+    for (int offset = WARP_SIZE / 2; offset > 0; offset >>= 1) {
+        val += __shfl_xor_sync(0xffffffff, val, offset);
+    }
     return val;
 }
 
 __device__ float warp_reduce_max(float val) {
-    // TODO: Implement warp-level max reduction using __shfl_xor_sync
+    #pragma unroll
+    for (int offset = WARP_SIZE / 2; offset > 0; offset >>= 1) {
+        val = fmaxf(val, __shfl_xor_sync(0xffffffff, val, offset));
+    }
     return val;
 }
 
@@ -70,18 +76,170 @@ __global__ void paged_attention_v1_kernel(
 ) {
     // Thread block handles one (sequence, head) pair.
     // Grid: (batch_size, n_head)
+    const int seq_idx  = blockIdx.x;
+    const int head_idx = blockIdx.y;
+    const int tid      = threadIdx.x;
+    const int num_threads = blockDim.x;
 
-    // TODO: Implement PagedAttention V1 kernel
-    // Steps:
-    //   1. Identify which sequence and head this block handles
-    //   2. Load query vector into registers / shared memory
-    //   3. For each logical block in the sequence's block table:
-    //      a. Look up the physical block id
-    //      b. Compute dot product of query with each key in the block
-    //      c. Track running max for numerical stability
-    //   4. Compute softmax using online softmax (numerically stable)
-    //   5. For each block, accumulate weighted values
-    //   6. Write output
+    const int context_len = context_lens[seq_idx];
+    if (context_len == 0) return;
+
+    // Pointer to this sequence's query vector for this head.
+    // query layout: [batch, n_head, head_dim]
+    const float* q = query + (seq_idx * n_head + head_idx) * head_dim;
+
+    // block_tables layout: [batch, max_blocks_per_seq]
+    const int* seq_block_table = block_tables + seq_idx * max_blocks_per_seq;
+
+    // -----------------------------------------------------------------------
+    // Pass 1: Compute Q·K scores for every context token, track global max.
+    // -----------------------------------------------------------------------
+    // Shared memory for storing per-token attention scores.
+    // Maximum tokens = MAX_BLOCK_SIZE * max_blocks_per_seq, but we don't know
+    // max_blocks_per_seq at compile time. Use dynamic shared memory or iterate
+    // in two passes. For simplicity, we use a two-pass approach with a fixed
+    // shared memory buffer for scores (up to max_context_len tokens).
+    //
+    // For V1 we use a simple approach: each thread loops over dimensions it
+    // owns to compute partial dot products, then warp-reduce to get the full
+    // score per token.
+
+    extern __shared__ float shared_mem[];
+    // shared_mem[0 .. context_len-1] = attention logits
+    // shared_mem[context_len .. context_len + head_dim - 1] = output accumulator
+    float* logits = shared_mem;
+    float* out_accum = shared_mem + context_len;
+
+    // Initialize output accumulator to zero.
+    for (int d = tid; d < head_dim; d += num_threads) {
+        out_accum[d] = 0.0f;
+    }
+
+    // Compute Q·K for each context token.
+    float thread_max = -FLT_MAX;
+
+    for (int token_idx = tid; token_idx < context_len; token_idx += num_threads) {
+        // Map token_idx to physical cache location.
+        int logical_block = token_idx / block_size;
+        int slot_in_block = token_idx % block_size;
+        int physical_block = seq_block_table[logical_block];
+
+        // key_cache layout: [num_blocks, block_size, n_head, head_dim]
+        const float* k = key_cache
+            + physical_block * (block_size * n_head * head_dim)
+            + slot_in_block * (n_head * head_dim)
+            + head_idx * head_dim;
+
+        // Full dot product (each thread does the full dot for its token).
+        float dot = 0.0f;
+        for (int d = 0; d < head_dim; d++) {
+            dot += q[d] * k[d];
+        }
+        dot *= scale;
+        logits[token_idx] = dot;
+        thread_max = fmaxf(thread_max, dot);
+    }
+
+    __syncthreads();
+
+    // -----------------------------------------------------------------------
+    // Reduce global max across all threads.
+    // -----------------------------------------------------------------------
+    // Warp-level reduce first.
+    float warp_max = warp_reduce_max(thread_max);
+    // Use first element of each warp to do block-level reduce via shared mem.
+    const int warp_id = tid / WARP_SIZE;
+    const int lane_id = tid % WARP_SIZE;
+    const int num_warps = (num_threads + WARP_SIZE - 1) / WARP_SIZE;
+
+    // Reuse a small region after out_accum for inter-warp communication.
+    // out_accum has head_dim floats; we need num_warps floats for reduce.
+    // Place warp reduce scratch after out_accum.
+    float* warp_scratch = shared_mem + context_len + head_dim;
+
+    if (lane_id == 0) {
+        warp_scratch[warp_id] = warp_max;
+    }
+    __syncthreads();
+
+    float global_max = -FLT_MAX;
+    if (tid < num_warps) {
+        global_max = warp_scratch[tid];
+    }
+    global_max = warp_reduce_max(global_max);
+    // Broadcast: after warp_reduce every lane in warp 0 has the value.
+    // Store to shared for other warps.
+    if (tid == 0) {
+        warp_scratch[0] = global_max;
+    }
+    __syncthreads();
+    global_max = warp_scratch[0];
+
+    // -----------------------------------------------------------------------
+    // Pass 2: Compute exp(logit - max) and sum, then normalize.
+    // -----------------------------------------------------------------------
+    float thread_sum = 0.0f;
+    for (int token_idx = tid; token_idx < context_len; token_idx += num_threads) {
+        float val = expf(logits[token_idx] - global_max);
+        logits[token_idx] = val;
+        thread_sum += val;
+    }
+
+    // Reduce sum across threads.
+    float warp_sum = warp_reduce_sum(thread_sum);
+    if (lane_id == 0) {
+        warp_scratch[warp_id] = warp_sum;
+    }
+    __syncthreads();
+
+    float global_sum = 0.0f;
+    if (tid < num_warps) {
+        global_sum = warp_scratch[tid];
+    }
+    global_sum = warp_reduce_sum(global_sum);
+    if (tid == 0) {
+        warp_scratch[0] = global_sum;
+    }
+    __syncthreads();
+    global_sum = warp_scratch[0];
+
+    // Normalize logits to get attention weights.
+    for (int token_idx = tid; token_idx < context_len; token_idx += num_threads) {
+        logits[token_idx] /= global_sum;
+    }
+    __syncthreads();
+
+    // -----------------------------------------------------------------------
+    // Pass 3: Compute weighted sum of values.
+    // -----------------------------------------------------------------------
+    // Each thread accumulates over dimensions it owns.
+    for (int d = tid; d < head_dim; d += num_threads) {
+        float acc = 0.0f;
+        for (int token_idx = 0; token_idx < context_len; token_idx++) {
+            int logical_block = token_idx / block_size;
+            int slot_in_block = token_idx % block_size;
+            int physical_block = seq_block_table[logical_block];
+
+            // value_cache layout: [num_blocks, block_size, n_head, head_dim]
+            const float* v = value_cache
+                + physical_block * (block_size * n_head * head_dim)
+                + slot_in_block * (n_head * head_dim)
+                + head_idx * head_dim;
+
+            acc += logits[token_idx] * v[d];
+        }
+        out_accum[d] = acc;
+    }
+
+    __syncthreads();
+
+    // -----------------------------------------------------------------------
+    // Write output: [batch, n_head, head_dim]
+    // -----------------------------------------------------------------------
+    float* out = output + (seq_idx * n_head + head_idx) * head_dim;
+    for (int d = tid; d < head_dim; d += num_threads) {
+        out[d] = out_accum[d];
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -89,6 +247,16 @@ __global__ void paged_attention_v1_kernel(
 // ---------------------------------------------------------------------------
 
 extern "C" {
+
+#include <stdio.h>
+
+#define CUDA_CHECK(call) do { \
+    cudaError_t err = (call); \
+    if (err != cudaSuccess) { \
+        fprintf(stderr, "CUDA error at %s:%d: %s\n", \
+                __FILE__, __LINE__, cudaGetErrorString(err)); \
+    } \
+} while(0)
 
 void paged_attention_forward(
     float* output,
@@ -104,19 +272,74 @@ void paged_attention_forward(
     int max_blocks_per_seq,
     int max_context_len
 ) {
+    CUDA_CHECK(cudaSetDevice(0));
+
     float scale = 1.0f / sqrtf((float)head_dim);
 
     // Grid: one block per (batch, head) pair
     dim3 grid(batch_size, n_head);
-    // Block: threads collaboratively process KV blocks
-    dim3 block(min(head_dim, 1024));
+    // Block: at least WARP_SIZE threads (needed for warp reductions),
+    // up to head_dim if larger, capped at 1024.
+    int threads = head_dim;
+    if (threads < WARP_SIZE) threads = WARP_SIZE;
+    if (threads > 1024)      threads = 1024;
+    dim3 block(threads);
 
-    paged_attention_v1_kernel<<<grid, block>>>(
-        output, query, key_cache, value_cache,
-        block_tables, context_lens,
+    // Dynamic shared memory: logits[max_context_len] + out_accum[head_dim]
+    //                        + warp_scratch[ceil(threads/WARP_SIZE)]
+    int num_warps = (threads + WARP_SIZE - 1) / WARP_SIZE;
+    size_t smem_bytes = (max_context_len + head_dim + num_warps) * sizeof(float);
+
+    // --- Compute buffer sizes ---
+    int num_blocks_cache = 0;
+    for (int i = 0; i < batch_size * max_blocks_per_seq; i++) {
+        if (block_tables[i] + 1 > num_blocks_cache)
+            num_blocks_cache = block_tables[i] + 1;
+    }
+
+    size_t query_bytes     = (size_t)batch_size * n_head * head_dim * sizeof(float);
+    size_t cache_bytes     = (size_t)num_blocks_cache * block_size * n_head * head_dim * sizeof(float);
+    size_t bt_bytes        = (size_t)batch_size * max_blocks_per_seq * sizeof(int);
+    size_t cl_bytes        = (size_t)batch_size * sizeof(int);
+    size_t output_bytes    = query_bytes;
+
+    // --- Allocate device memory ---
+    float *d_output, *d_query, *d_key_cache, *d_value_cache;
+    int   *d_block_tables, *d_context_lens;
+    CUDA_CHECK(cudaMalloc(&d_output,       output_bytes));
+    CUDA_CHECK(cudaMalloc(&d_query,        query_bytes));
+    CUDA_CHECK(cudaMalloc(&d_key_cache,    cache_bytes));
+    CUDA_CHECK(cudaMalloc(&d_value_cache,  cache_bytes));
+    CUDA_CHECK(cudaMalloc(&d_block_tables, bt_bytes));
+    CUDA_CHECK(cudaMalloc(&d_context_lens, cl_bytes));
+
+    // --- Copy inputs host → device ---
+    CUDA_CHECK(cudaMemcpy(d_query,        query,        query_bytes, cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_key_cache,    key_cache,    cache_bytes, cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_value_cache,  value_cache,  cache_bytes, cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_block_tables, block_tables, bt_bytes,    cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_context_lens, context_lens, cl_bytes,    cudaMemcpyHostToDevice));
+
+    // --- Launch kernel ---
+    paged_attention_v1_kernel<<<grid, block, smem_bytes>>>(
+        d_output, d_query, d_key_cache, d_value_cache,
+        d_block_tables, d_context_lens,
         block_size, max_blocks_per_seq,
         n_head, head_dim, scale
     );
+    CUDA_CHECK(cudaGetLastError());
+
+    // --- Copy output device → host ---
+    CUDA_CHECK(cudaDeviceSynchronize());
+    CUDA_CHECK(cudaMemcpy(output, d_output, output_bytes, cudaMemcpyDeviceToHost));
+
+    // --- Free device memory ---
+    cudaFree(d_output);
+    cudaFree(d_query);
+    cudaFree(d_key_cache);
+    cudaFree(d_value_cache);
+    cudaFree(d_block_tables);
+    cudaFree(d_context_lens);
 }
 
 }  // extern "C"
