@@ -1,0 +1,358 @@
+%%%%%%%% Midterm Report — Reimplementing PagedAttention in MiniTorch %%%%%%%%%
+
+\documentclass{article}
+
+\usepackage{microtype}
+\usepackage{graphicx}
+\usepackage{subfigure}
+\usepackage{booktabs}
+\usepackage{amsmath}
+\usepackage{hyperref}
+
+\newcommand{\theHalgorithm}{\arabic{algorithm}}
+
+\usepackage[accepted]{mlsys2024}
+
+\mlsystitlerunning{Midterm Report: Reimplementing PagedAttention in MiniTorch}
+
+\begin{document}
+
+\twocolumn[
+\mlsystitle{Midterm Report: Reimplementing PagedAttention in MiniTorch}
+
+\mlsyssetsymbol{equal}{*}
+
+\begin{mlsysauthorlist}
+\mlsysauthor{NingRui Yang}{affil}
+\mlsysauthor{Yixiang Dai}{affil}
+\end{mlsysauthorlist}
+
+\mlsysaffiliation{affil}{ECE, Carnegie Mellon University, Pittsburgh, PA, US}
+
+\mlsyskeywords{PagedAttention, KV Cache, MiniTorch, LLM Inference, CUDA}
+
+\vskip 0.3in
+
+\begin{abstract}
+We present a from-scratch reimplementation of PagedAttention within the MiniTorch educational deep learning framework.
+PagedAttention~\cite{kwon2023efficient} eliminates KV cache fragmentation during LLM inference by managing cache memory in non-contiguous blocks via a block table, analogous to virtual memory paging.
+Our implementation spans three layers: (1)~a Python-level block memory manager with reference-counted allocation and fragmentation tracking, (2)~a custom CUDA kernel (\texttt{paged\_attention\_v1\_kernel}) that computes scaled dot-product attention directly over non-contiguous cache blocks using warp-level reductions, and (3)~a transformer integration that supports both prefill and autoregressive decode phases.
+As of the midterm checkpoint, all three components are functionally complete and pass 15 correctness tests, including end-to-end tests that validate the CUDA kernel output against a Python reference implementation within $10^{-4}$ tolerance.
+We discuss the system-level challenges encountered---notably, a CUDA runtime/driver API context conflict between PyTorch, Numba, and our custom kernel---and outline the remaining work on benchmarking and optimization.
+\end{abstract}
+]
+
+\printAffiliationsAndNotice{}
+
+% ============================================================================
+\section{Introduction}
+\label{sec:intro}
+
+Large Language Model (LLM) inference is bottlenecked by the Key-Value (KV) cache, which stores the projected key and value vectors for all previously generated tokens and grows linearly with context length.
+Production serving systems typically allocate KV cache memory in large, contiguous blocks---one per request at maximum sequence length---leading to three compounding problems:
+\begin{enumerate}
+    \item \textbf{Internal fragmentation.} Pre-allocated blocks waste memory on slots that are never filled because generation terminates early.
+    \item \textbf{External fragmentation.} As requests arrive and depart, freed blocks leave non-contiguous holes that cannot be coalesced.
+    \item \textbf{Reduced concurrency.} Together, these effects artificially limit the batch size that fits in GPU memory, under-utilizing both memory and compute.
+\end{enumerate}
+
+PagedAttention~\cite{kwon2023efficient} addresses this by borrowing the paging abstraction from operating systems: the KV cache is divided into small, fixed-size \emph{blocks} (pages) that need not be contiguous in physical GPU memory.
+A per-sequence \emph{block table} maps logical token positions to physical block identifiers at runtime, enabling near-zero-waste memory utilization and on-demand block allocation.
+
+\paragraph{Motivation.}
+While PagedAttention is deployed in production systems such as vLLM~\cite{kwon2023efficient}, Hugging Face TGI~\cite{huggingface2023tgi}, and TensorRT-LLM~\cite{tensorrtllm2024}, existing implementations are tightly coupled to large, heavily optimized codebases that obscure the core algorithmic ideas.
+By reimplementing PagedAttention within MiniTorch---a minimal educational framework from CMU 11-868---we aim to provide a self-contained, readable implementation that exposes the system-level design decisions without the complexity of a production system.
+
+\paragraph{Contributions.}
+At the midterm checkpoint, our contributions are:
+\begin{enumerate}
+    \item A block-based KV cache memory manager with allocation, deallocation, reference counting, and fragmentation metrics.
+    \item A custom CUDA kernel that performs scaled dot-product attention directly over non-contiguous memory blocks in three passes (QK scoring, stable softmax, value accumulation) with warp-level reductions.
+    \item Integration of the above into a MiniTorch transformer model supporting both prompt prefill and single-token decode.
+    \item A comprehensive test suite (15 tests) validating correctness from individual block operations through end-to-end autoregressive generation.
+\end{enumerate}
+
+% ============================================================================
+\section{Related Work and Background}
+\label{sec:related}
+
+\paragraph{PagedAttention and vLLM.}
+Kwon et al.~\cite{kwon2023efficient} introduced PagedAttention as the core memory management mechanism in the vLLM serving engine.
+Their approach partitions the KV cache into fixed-size blocks (typically 16 tokens) and introduces a block table for logical-to-physical mapping.
+The original CUDA kernels are highly optimized with template specialization for head dimensions, multi-level tiling, and warp-level partitioning.
+Our implementation follows the same algorithmic structure (the ``V1 kernel'' in vLLM terminology) but prioritizes clarity over peak performance: we use a single kernel variant with dynamic shared memory rather than compile-time template parameters.
+
+\paragraph{FlashAttention.}
+FlashAttention~\cite{dao2022flashattention} and FlashAttention-2~\cite{dao2023flashattention2} optimize attention computation through IO-aware tiling and kernel fusion, reducing HBM reads by keeping partial softmax statistics on-chip.
+However, FlashAttention assumes contiguous KV storage and does not address the memory \emph{management} problem of dynamic allocation during autoregressive serving.
+FlashInfer~\cite{ye2025flashinfer} extends flash-style kernels to support both ragged and paged KV cache layouts, bridging the gap between computation efficiency and memory flexibility.
+Our work is closest to vLLM's V1 kernel but embedded in an educational framework.
+
+\paragraph{Operating System Analogies.}
+The paging metaphor in PagedAttention draws directly from OS virtual memory management~\cite{silberschatz2018os}.
+A block table serves the role of a page table, mapping logical token indices to physical block IDs.
+Our block manager implements a simplified version of this with FIFO free-list allocation, reference counting (analogous to shared pages), and fragmentation tracking similar to an OS memory metrics module.
+
+\paragraph{MiniTorch.}
+MiniTorch is a pedagogical deep learning library used in CMU 11-868~\cite{rush2020minitorch}. It provides tensor operations, automatic differentiation, and CUDA backends via Numba JIT (driver API) and custom \texttt{.cu} kernels loaded through ctypes (runtime API).
+We build on the hw3/hw4 codebase, extending it with paged attention, transformer generation support, and system-level runtime fixes.
+
+% ============================================================================
+\section{Methodology}
+\label{sec:method}
+
+Our implementation addresses three research questions:
+\begin{itemize}
+    \item[\textbf{RQ1}] Can a simple block-based allocator reproduce the near-zero fragmentation benefits of PagedAttention?
+    \item[\textbf{RQ2}] Can a single, non-templated CUDA kernel correctly compute attention over non-contiguous cache blocks?
+    \item[\textbf{RQ3}] What system-level integration challenges arise when combining custom CUDA runtime API code with MiniTorch's existing Numba~+~PyCUDA backends?
+\end{itemize}
+
+\subsection{Block Memory Manager}
+\label{sec:block_manager}
+
+The \texttt{BlockManager} (Figure~\ref{fig:architecture}) manages a pool of $N$ physical blocks, each holding $B$ token slots (default $B=16$).
+Key data structures include:
+
+\begin{itemize}
+    \item \textbf{Free list} (\texttt{free\_block\_ids}): a FIFO queue of available block IDs.
+    \item \textbf{Block metadata} (\texttt{KVBlock}): per-block tracking of fill count, reference count, and capacity.
+    \item \textbf{Block table} (\texttt{BlockTable}): a per-sequence mapping from logical block indices to physical block IDs.
+    \item \textbf{Global KV cache}: two NumPy arrays of shape $(N, B, H, D)$ where $H$ is the number of attention heads and $D$ is the head dimension.
+\end{itemize}
+
+The allocation protocol works as follows:
+\texttt{allocate\_blocks\_for\_sequence} computes $\lceil T/B \rceil$ blocks for a $T$-token prompt, pops block IDs from the free list, creates a \texttt{BlockTable}, and distributes fill counts.
+\texttt{append\_token\_to\_sequence} checks whether the tail block is full; if so, it allocates a new block before incrementing the fill count.
+\texttt{free\_sequence} decrements reference counts and returns zero-reference blocks to the free list, zeroing their cache slices.
+
+We track two fragmentation metrics: \emph{internal fragmentation} measures wasted slots within allocated blocks ($1 - \text{used}/\text{capacity}$), and \emph{external fragmentation} measures the fraction of free blocks trapped between the minimum and maximum used block IDs.
+
+\begin{figure}[t]
+\centering
+\small
+\begin{verbatim}
+  Sequence 0 (7 tokens, block_size=4)
+  
+  Block Table: [2, 5]
+  Logical:  [tok0..tok3] [tok4..tok6, _]
+  Physical: block_2       block_5
+  
+  key_cache[2, 0:4, :, :] = K for tok0..3
+  key_cache[5, 0:3, :, :] = K for tok4..6
+\end{verbatim}
+\caption{Logical-to-physical mapping via the block table. Sequence~0 has 7 tokens distributed across physical blocks~2 and~5. Block~5 has 1 empty slot (internal fragmentation).}
+\label{fig:architecture}
+\end{figure}
+
+\subsection{CUDA Kernel}
+\label{sec:kernel}
+
+The \texttt{paged\_attention\_v1\_kernel} computes attention for one (sequence, head) pair per thread block, with grid dimensions $(\text{batch\_size}, n\_\text{head})$.
+The thread count is set to $\max(32, \min(\text{head\_dim}, 1024))$ to ensure at least one full warp for warp-level primitives.
+
+The kernel uses dynamic shared memory partitioned as:
+\[
+\underbrace{\text{logits}[\text{ctx\_len}]}_{\text{Pass 1--2}} \;\|\; \underbrace{\text{out\_accum}[D]}_{\text{Pass 3}} \;\|\; \underbrace{\text{warp\_scratch}[W]}_{\text{reductions}}
+\]
+where $W = \lceil \text{threads} / 32 \rceil$ is the number of warps.
+
+\paragraph{Pass 1: QK Scoring.}
+Each thread iterates over the context tokens it owns ($\text{stride} = \text{num\_threads}$).
+For each token, it maps the logical index to a physical cache location via the block table:
+\begin{align*}
+\text{logical\_block} &= \lfloor t / B \rfloor \\
+\text{slot} &= t \bmod B \\
+\text{physical\_block} &= \text{block\_table}[\text{logical\_block}]
+\end{align*}
+It then computes the full dot product $\mathbf{q} \cdot \mathbf{k}_t / \sqrt{D}$ and stores the result in shared memory.
+
+\paragraph{Stable Softmax.}
+A global maximum is found via a two-level reduction: intra-warp reduction with \texttt{\_\_shfl\_xor\_sync} (\texttt{warp\_reduce\_max}), followed by inter-warp reduction through shared memory.
+Each thread then computes $\exp(\text{logit}_t - \max)$ and the sum is reduced using the same warp-then-block pattern.
+Finally, each logit is normalized in-place to produce attention weights.
+
+\paragraph{Pass 3: Value Accumulation.}
+Each thread accumulates the weighted sum $\sum_t w_t \cdot v_t[d]$ for the head dimensions it owns, again performing block-table lookups on every value access.
+The result is written to global memory.
+
+\paragraph{Host Launcher.}
+The extern ``C'' launcher manages GPU memory explicitly: it allocates device buffers via \texttt{cudaMalloc}, copies inputs host-to-device, launches the kernel, synchronizes, copies the output device-to-host, and frees all device memory.
+The \texttt{.so} is compiled with \texttt{-{}-cudart shared} to share the process-wide CUDA runtime library, avoiding conflicts with Numba's driver API context (see Section~\ref{sec:cuda_conflict}).
+
+\subsection{Transformer Integration}
+\label{sec:transformer}
+
+The transformer model consists of \texttt{PagedDecoderLM} $\to$ \texttt{PagedTransformerLayer} $\to$ \texttt{PagedMultiHeadAttention}, following a Pre-LN architecture~\cite{xiong2020layer}.
+
+\paragraph{Prefill Phase.}
+Given a prompt of length $T$, the model projects $Q$, $K$, $V$ via linear layers, applies standard causal masked attention over the full prompt (contiguous computation), and populates the KV cache through the block manager.
+
+\paragraph{Decode Phase.}
+For each new token, $Q$, $K$, $V$ are projected for the single-token input.
+The new KV pair is appended to the cache via \texttt{write\_token\_kv()}, potentially allocating a new block.
+Attention is then computed over all cached tokens using \texttt{paged\_attention\_ref()}, which gathers non-contiguous blocks through the block table for each sequence.
+
+\paragraph{Generation Loop.}
+The \texttt{generate()} method orchestrates the full autoregressive loop: prefill $\to$ sample $\to$ decode~$\times~(\texttt{max\_new\_tokens} - 1)$, with temperature-controlled sampling (softmax + multinomial or argmax) and cleanup via \texttt{free\_sequence()}.
+
+% ============================================================================
+\section{Experiments}
+\label{sec:experiments}
+
+\subsection{Correctness Validation}
+
+We validate correctness through a comprehensive test suite organized into six test classes covering the full stack from individual block operations to end-to-end generation.
+Table~\ref{tab:tests} summarizes the results: all 15 tests pass.
+
+\begin{table}[t]
+\centering
+\caption{Test suite results. All tests pass with the CUDA kernel validated against the Python reference within $10^{-4}$ tolerance.}
+\label{tab:tests}
+\vskip 0.1in
+\begin{small}
+\begin{tabular}{@{}llc@{}}
+\toprule
+\textbf{Test Class} & \textbf{What is tested} & \textbf{Pass} \\
+\midrule
+\texttt{StandardAttention} & Identity, causal mask & 2/2 \\
+\texttt{PagedVsStandard} & \begin{tabular}[t]{@{}l@{}}Single/multi block,\\ batch, block size sweep\end{tabular} & 4/4 \\
+\texttt{PagedMultiHeadAttn} & Prefill cache, decode & 2/2 \\
+\texttt{PagedTransformerLayer} & Shape, residual conn. & 3/3 \\
+\texttt{PagedDecoderLM} & Generate, free seqs & 2/2 \\
+\texttt{PagedAttnKernel} & CUDA single \& batch & 2/2 \\
+\midrule
+\textbf{Total} & & \textbf{15/15} \\
+\bottomrule
+\end{tabular}
+\end{small}
+\vskip -0.1in
+\end{table}
+
+\textbf{Kernel Correctness.}
+The two CUDA kernel tests construct random queries, keys, and values, populate a paged cache via \texttt{build\_paged\_cache()}, and compare the kernel output against \texttt{paged\_attention\_ref()} using \texttt{np.testing.assert\_allclose} with $\text{atol}=\text{rtol}=10^{-4}$.
+The single-sequence test uses 2~heads, head dimension~4, block size~4, and context length~7 (spanning 2~blocks).
+The batched test uses 3~sequences with context lengths $[3, 7, 5]$ and padded block tables, verifying correct handling of variable-length inputs.
+
+\noindent\textbf{Paged vs.\ Standard Attention.}
+Four tests compare \texttt{paged\_attention\_ref()} against \texttt{standard\_attention()} to ensure the paging indirection preserves correctness.
+A block-size sweep over $B \in \{1, 4, 8, 16, 32\}$ demonstrates robustness to this hyperparameter, with all configurations matching within $10^{-5}$.
+
+\noindent\textbf{End-to-End Generation.}
+The \texttt{TestPagedDecoderLM} tests instantiate a small model (vocab~50, embedding~32, 2~heads, 2~layers) and run \texttt{generate()} for 5~new tokens.
+Tests verify correct output shape and that \texttt{free\_sequence()} returns all blocks to the free pool after generation completes.
+
+\subsection{Benchmarking (Planned)}
+
+Quantitative performance benchmarks are planned for the final report and will include:
+\begin{itemize}
+    \item \textbf{Throughput}: tokens/second for prefill and decode, comparing paged vs.\ contiguous attention.
+    \item \textbf{Memory utilization}: peak KV cache bytes and utilization ratio under varying batch sizes and sequence lengths.
+    \item \textbf{Fragmentation}: internal and external fragmentation under synthetic workloads with dynamic request arrivals and departures.
+    \item \textbf{Max batch size}: largest batch achievable before OOM, comparing paged allocation against pre-allocated contiguous KV.
+\end{itemize}
+
+% ============================================================================
+\section{Analysis}
+\label{sec:analysis}
+
+\subsection{CUDA Runtime vs.\ Driver API Context Conflict}
+\label{sec:cuda_conflict}
+
+A significant engineering challenge arose from the interaction between three CUDA subsystems used concurrently in MiniTorch:
+
+\begin{enumerate}
+    \item \textbf{PyTorch} -- uses the CUDA \emph{runtime} API (\texttt{cudaMalloc}, \texttt{cudaMemcpy}).
+    \item \textbf{Numba} -- uses the CUDA \emph{driver} API (\texttt{cuCtxCreate}) for JIT-compiled kernels in \texttt{cuda\_ops.py}.
+    \item \textbf{Our kernel} -- compiled as a shared library (\texttt{.so}) and invoked via ctypes, using the CUDA \emph{runtime} API in its host launcher.
+\end{enumerate}
+
+When MiniTorch's \texttt{\_\_init\_\_.py} imported \texttt{cuda\_ops} (which triggers \texttt{numba.cuda}), the Numba driver API created a CUDA context \emph{before} the runtime API was initialized.
+This caused all subsequent runtime API calls---\texttt{cudaSetDevice}, \texttt{cudaMalloc}, \texttt{cudaMemcpy}---to fail with ``no CUDA-capable device is detected,'' producing all-zero output from the kernel.
+
+The root cause was two-fold:
+\begin{enumerate}
+    \item The \texttt{paged\_attention.so} was compiled with \emph{static} CUDA runtime linking (the \texttt{nvcc} default), giving it a private copy of \texttt{libcudart} that could not interoperate with the existing driver context.
+    \item The import order initialized the driver API before the runtime API, and the statically linked runtime could not recover.
+\end{enumerate}
+
+\paragraph{Resolution.}
+We applied three fixes:
+(1)~recompiled the \texttt{.so} with \texttt{-{}-cudart~shared} so it uses the process-wide \texttt{libcudart.so};
+(2)~added an early \texttt{torch.cuda.init()} call in \texttt{\_\_init\_\_.py} before importing \texttt{cuda\_ops}, ensuring the runtime API context is established first;
+(3)~made PyCUDA import lazy (\texttt{\_ensure\_pycuda()}) in \texttt{cuda\_kernel\_ops.py} to defer driver context creation.
+After these fixes, all CUDA subsystems coexist correctly.
+
+This experience illustrates a class of system challenges that production serving frameworks must handle but that are rarely discussed in algorithm-focused papers: the interaction between multiple CUDA context models within a single process.
+
+\subsection{Kernel Design Trade-offs}
+\label{sec:kernel_tradeoffs}
+
+Our V1 kernel assigns one thread block per (sequence, head) pair.
+This is the simplest mapping but has several performance implications:
+
+\begin{itemize}
+    \item \textbf{Per-token dot product.} Each thread computes the \emph{full} dot product $\mathbf{q} \cdot \mathbf{k}_t$ for its assigned tokens.
+    This works well for small head dimensions (e.g., $D=64$) but leaves threads idle when $D < 32$ (warp size) during Pass~3, since threads beyond $D$ contribute nothing to value accumulation.
+    The vLLM kernel uses thread-group partitioning where multiple threads cooperate on each dot product.
+
+    \item \textbf{Non-coalesced cache access.} The cache layout $[N_{\text{blocks}}, B, H, D]$ means that consecutive threads in Pass~1 access different context tokens, which may reside in different physical blocks with non-contiguous addresses.
+    A transposed layout (e.g., $[N_{\text{blocks}}, H, D/x, B, x]$ as in vLLM) would enable coalesced reads.
+
+    \item \textbf{Shared memory limit.} Dynamic shared memory of size $(\text{ctx\_len} + D + W) \times 4$ bytes limits the maximum context length.
+    For $\text{ctx\_len} = 2048$, $D = 128$, $W = 4$, this is $\sim$8.7\,KB---well within the 48\,KB SM limit.
+    However, contexts exceeding $\sim$12K tokens would require a multi-block ``V2'' decomposition.
+\end{itemize}
+
+\subsection{Memory Management Overhead}
+
+Each kernel invocation currently copies all inputs from host to device and the output back.
+This is correct but introduces per-call overhead proportional to cache size, which would dominate at large batch sizes.
+A production system keeps the KV cache GPU-resident; our host-mediated approach is a deliberate simplification for the educational setting.
+
+% ============================================================================
+\section{Conclusion and Discussion}
+\label{sec:conclusion}
+
+We have implemented a functionally complete reimplementation of PagedAttention within MiniTorch, covering the block memory manager, a correctness-validated CUDA kernel, and full transformer integration with prefill/decode generation.
+The implementation passes 15 comprehensive tests spanning individual components through end-to-end generation.
+
+\paragraph{Key takeaways.}
+\begin{enumerate}
+    \item The paging abstraction translates cleanly from OS virtual memory to KV cache management: a free list, block tables, and reference-counted physical blocks suffice for the allocator.
+    \item A three-pass kernel (QK scores $\to$ stable softmax $\to$ value accumulation) with warp-level reductions provides a correct and readable implementation of attention over non-contiguous memory, suitable for pedagogical purposes.
+    \item System-level integration is non-trivial: the CUDA runtime/driver API context conflict required careful import ordering and linking configuration---a class of challenges that production LLM systems must address but that algorithm papers rarely discuss.
+\end{enumerate}
+
+\paragraph{Remaining work.}
+For the final report, we plan to:
+\begin{itemize}
+    \item Implement and run throughput and memory utilization benchmarks comparing paged vs.\ contiguous attention.
+    \item Switch the decode path from the Python reference to the CUDA kernel for performance measurement.
+    \item Explore kernel optimizations (coalesced memory layout, thread-group partitioning, online softmax) and quantify their impact.
+    \item Evaluate fragmentation under dynamic workloads with request churn (arrivals and departures).
+    \item Profile the kernel with Nsight Compute to analyze memory bandwidth utilization, occupancy, and warp stall reasons.
+\end{itemize}
+
+% ============================================================================
+\section{Limitations}
+\label{sec:limitations}
+
+\begin{enumerate}
+    \item \textbf{Host-device copies per call.} Each kernel invocation copies all inputs from host memory to GPU and back, rather than keeping the KV cache GPU-resident. This adds latency overhead that would be unacceptable in production.
+    
+    \item \textbf{Single kernel variant.} We implement only the V1 kernel (one thread block per sequence per head). For long contexts ($>$2K tokens), a V2 multi-block decomposition would be needed to maintain GPU occupancy.
+    
+    \item \textbf{No template specialization.} All head dimensions and block sizes are handled dynamically, forgoing the compiler optimization opportunities that compile-time constants enable.
+    
+    \item \textbf{Non-coalesced memory access.} The $[N_{\text{blocks}}, B, H, D]$ cache layout does not optimize for GPU memory coalescing.
+    
+    \item \textbf{Educational framework overhead.} MiniTorch's surrounding operations (projections, layer norm, embedding) are CPU-based, making end-to-end throughput numbers less meaningful for evaluating kernel performance in isolation.
+    
+    \item \textbf{No benchmarks yet.} Quantitative performance evaluation is deferred to the final report; the current work establishes correctness only.
+\end{enumerate}
+
+\bibliography{example_paper}
+\bibliographystyle{mlsys2024}
+
+\end{document}
