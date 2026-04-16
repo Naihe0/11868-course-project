@@ -195,11 +195,11 @@ python project/run_benchmark.py --batch-sizes 1 2 4 8 --seq-lengths 128 256 512 
 
 ### Benchmarks and reporting
 
-- [ ] Implement throughput measurement in `project/run_benchmark.py`
-- [ ] Implement fragmentation measurement in `project/run_benchmark.py`
-- [ ] Implement max-batch-size search in `project/run_benchmark.py`
-- [ ] Implement correctness comparison in `project/run_benchmark.py`
-- [ ] Save benchmark outputs to `benchmarks/results/benchmark_results.csv`
+- [x] Implement throughput measurement in `project/run_benchmark.py`
+- [x] Implement fragmentation measurement in `project/run_benchmark.py`
+- [x] Implement max-batch-size search in `project/run_benchmark.py`
+- [x] Implement correctness comparison in `project/run_benchmark.py`
+- [x] Save benchmark outputs to `benchmarks/results/benchmark_results.csv`
 - [ ] Add benchmark plots / summary discussion to `benchmarks/README.md`
 
 ## References

@@ -1,5 +1,3 @@
-from turtle import back
-from zipapp import create_archive
 import numpy as np
 from .tensor import tensor, tensor_from_numpy, MatMul, Mul, Add
 from .module import Module, Parameter
