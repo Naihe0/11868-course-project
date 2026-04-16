@@ -24,7 +24,7 @@ from minitorch.block_manager import BlockManager, BlockTable, KVBlock, DEFAULT_B
 @pytest.fixture
 def small_manager():
     """BlockManager with 8 blocks, block_size=4, 2 heads, head_dim=8."""
-    return BlockManager(num_blocks=8, block_size=4, n_head=2, head_dim=8)
+    return BlockManager(num_blocks=8, block_size=4, n_head=2, head_dim=8, num_layers=1)
 
 
 # ---------------------------------------------------------------------------
@@ -35,8 +35,10 @@ class TestBlockAllocation:
     def test_initial_state(self, small_manager):
         assert small_manager.num_free_blocks == 8
         assert small_manager.num_used_blocks == 0
-        assert small_manager.key_cache.shape == (8, 4, 2, 8)
-        assert small_manager.value_cache.shape == (8, 4, 2, 8)
+        assert len(small_manager.key_cache) == 1
+        assert len(small_manager.value_cache) == 1
+        assert small_manager.key_cache[0].shape == (8, 4, 2, 8)
+        assert small_manager.value_cache[0].shape == (8, 4, 2, 8)
         assert small_manager.free_block_ids == list(range(8))
 
     def test_allocate_single_block(self, small_manager):
@@ -120,12 +122,30 @@ class TestSequenceManagement:
         key = np.ones((2, 8), dtype=np.float32)
         value = np.full((2, 8), 3.0, dtype=np.float32)
 
-        block_id, slot_idx = small_manager.write_token_kv(5, key, value)
+        block_id, slot_idx = small_manager.write_token_kv(5, key, value, layer=0)
 
         assert (block_id, slot_idx) == (0, 0)
-        np.testing.assert_allclose(small_manager.key_cache[0, 0], key)
-        np.testing.assert_allclose(small_manager.value_cache[0, 0], value)
+        np.testing.assert_allclose(small_manager.key_cache[0][0, 0], key)
+        np.testing.assert_allclose(small_manager.value_cache[0][0, 0], value)
         assert small_manager.context_lens[5] == 1
+
+    def test_allocate_blocks_for_sequence_oom_keeps_state_consistent(self, small_manager):
+        small_manager.allocate_blocks_for_sequence(seq_id=1, num_tokens=8)
+
+        with pytest.raises(RuntimeError):
+            small_manager.allocate_blocks_for_sequence(seq_id=2, num_tokens=40)
+
+        assert 2 not in small_manager.block_tables
+        assert 2 not in small_manager.context_lens
+        assert small_manager.block_tables[1].block_ids == [0, 1]
+        assert small_manager.num_free_blocks == 6
+        assert sorted(small_manager.free_block_ids) == [2, 3, 4, 5, 6, 7]
+
+    def test_allocate_blocks_for_existing_sequence_raises(self, small_manager):
+        small_manager.allocate_blocks_for_sequence(seq_id=8, num_tokens=4)
+
+        with pytest.raises(ValueError):
+            small_manager.allocate_blocks_for_sequence(seq_id=8, num_tokens=2)
 
 
 # ---------------------------------------------------------------------------

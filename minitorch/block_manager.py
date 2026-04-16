@@ -88,7 +88,10 @@ class BlockManager:
         n_head: int = 8,
         head_dim: int = 64,
         cache_dtype: np.dtype = CACHE_DTYPE,
+        num_layers: int = None,
     ):
+        if num_layers is None:
+            raise ValueError("BlockManager requires an explicit num_layers")
         self.num_blocks = num_blocks
         self.block_size = block_size
         self.n_head = n_head
@@ -108,8 +111,9 @@ class BlockManager:
 
         # Global K/V caches indexed by physical block id.
         cache_shape = (num_blocks, block_size, n_head, head_dim)
-        self.key_cache = np.zeros(cache_shape, dtype=cache_dtype)
-        self.value_cache = np.zeros(cache_shape, dtype=cache_dtype)
+        self.num_layers = num_layers
+        self.key_cache = [np.zeros(cache_shape, dtype=cache_dtype) for _ in range(num_layers)]
+        self.value_cache = [np.zeros(cache_shape, dtype=cache_dtype) for _ in range(num_layers)]
 
     # ----- Capacity queries ------------------------------------------------
 
@@ -117,7 +121,10 @@ class BlockManager:
     def num_free_blocks(self) -> int:
         """Return the number of unallocated physical blocks."""
         return len(self.free_block_ids)
-
+    def get_key_cache(self, layer: int) -> np.ndarray:
+        return self.key_cache[layer]
+    def get_value_cache(self, layer: int) -> np.ndarray:
+        return self.value_cache[layer]
     @property
     def num_used_blocks(self) -> int:
         return self.num_blocks - self.num_free_blocks
@@ -145,8 +152,9 @@ class BlockManager:
         block = self.blocks[block_id]
         block.ref_count = 1
         block.num_filled = 0
-        self.key_cache[block_id].fill(0)
-        self.value_cache[block_id].fill(0)
+        for layer in range(self.num_layers):
+            self.key_cache[layer][block_id].fill(0)
+            self.value_cache[layer][block_id].fill(0)
         return block
 
     def allocate_blocks_for_sequence(self, seq_id: int, num_tokens: int) -> BlockTable:
@@ -156,17 +164,43 @@ class BlockManager:
         The actual K/V vectors will later be written into `key_cache` and
         `value_cache`, not into the KVBlock objects themselves.
         """
-        self.context_lens[seq_id] = num_tokens
+        if num_tokens < 0:
+            raise ValueError("num_tokens must be non-negative")
+        if seq_id in self.block_tables:
+            raise ValueError(f"Sequence {seq_id} already has allocated blocks")
+
         num_blocks = math.ceil(num_tokens / self.block_size)
+        if not self.can_allocate(num_blocks):
+            raise RuntimeError(
+                f"Not enough free blocks for sequence {seq_id}: "
+                f"need {num_blocks}, have {self.num_free_blocks}"
+            )
+
         block_table = BlockTable(seq_id)
-        for i in range(num_blocks):
-            block = self.allocate_block()
-            block_table.append_block(block.block_id)
-            if num_tokens>self.block_size:
-                block.num_filled = self.block_size
-            else:
-                block.num_filled = num_tokens
-            num_tokens -= block.num_filled
+        remaining_tokens = num_tokens
+        allocated_block_ids = []
+        try:
+            for _ in range(num_blocks):
+                block = self.allocate_block()
+                allocated_block_ids.append(block.block_id)
+                block_table.append_block(block.block_id)
+                if remaining_tokens > self.block_size:
+                    block.num_filled = self.block_size
+                else:
+                    block.num_filled = remaining_tokens
+                remaining_tokens -= block.num_filled
+        except Exception:
+            for block_id in allocated_block_ids:
+                self.blocks[block_id].ref_count = 0
+                self.blocks[block_id].num_filled = 0
+                for layer_id in range(self.num_layers):
+                    self.key_cache[layer_id][block_id].fill(0)
+                    self.value_cache[layer_id][block_id].fill(0)
+                self.free_block_ids.append(block_id)
+            self.free_block_ids.sort()
+            raise
+
+        self.context_lens[seq_id] = num_tokens
         self.block_tables[seq_id] = block_table
         return block_table
 
@@ -202,8 +236,9 @@ class BlockManager:
             self.blocks[block_id].ref_count -= 1
             if self.blocks[block_id].ref_count == 0:
                 self.blocks[block_id].num_filled = 0
-                self.key_cache[block_id].fill(0)
-                self.value_cache[block_id].fill(0)
+                for layer_id in range(self.num_layers):
+                    self.key_cache[layer_id][block_id].fill(0)
+                    self.value_cache[layer_id][block_id].fill(0)
                 self.free_block_ids.append(block_id)
         del self.block_tables[seq_id]
         del self.context_lens[seq_id]
@@ -227,20 +262,22 @@ class BlockManager:
         slot_idx: int,
         key: np.ndarray,
         value: np.ndarray,
+        layer: int = 0,
     ) -> None:
         """Write one token's K/V vectors into the global cache."""
         if key.shape != (self.n_head, self.head_dim):
             raise ValueError(f"Key shape must be ({self.n_head}, {self.head_dim})")
         if value.shape != (self.n_head, self.head_dim):
             raise ValueError(f"Value shape must be ({self.n_head}, {self.head_dim})")
-        self.key_cache[block_id, slot_idx, :, :] = key
-        self.value_cache[block_id, slot_idx, :, :] = value
+        self.key_cache[layer][block_id, slot_idx, :, :] = key
+        self.value_cache[layer][block_id, slot_idx, :, :] = value
 
     def write_token_kv(
         self,
         seq_id: int,
         key: np.ndarray,
         value: np.ndarray,
+        layer: int,
     ) -> Tuple[int, int]:
         """Append one token and write its K/V vectors.
 
@@ -253,7 +290,7 @@ class BlockManager:
         # TODO: Implement append-and-write helper.
         block = self.append_token_to_sequence(seq_id)
         slot_idx = block.num_filled - 1
-        self.write_kv_slot(block.block_id, slot_idx, key, value)
+        self.write_kv_slot(block.block_id, slot_idx, key, value, layer)
         return block.block_id, slot_idx
 
     def get_block_table_array(

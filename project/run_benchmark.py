@@ -54,6 +54,12 @@ def parse_args():
     parser.add_argument("--output-dir", type=str, default="benchmarks/results")
     parser.add_argument("--backend", type=str, default="cpu",
                         choices=["cpu", "cuda"])
+    parser.add_argument("--decode-backend", type=str, default="ref",
+                        choices=["ref", "cuda"])
+    parser.add_argument("--compare-to-ref", action="store_true",
+                        help="When using CUDA decode, also run the reference "
+                             "paged attention and assert the outputs match.")
+    parser.add_argument("--compare-tolerance", type=float, default=1e-4)
     parser.add_argument("--skip-correctness", action="store_true",
                         help="Skip correctness check to speed up benchmarking")
     parser.add_argument("--skip-max-batch", action="store_true",
@@ -75,7 +81,8 @@ def _create_backend(backend_name: str):
 
 
 def _create_model(n_vocab, n_embd, n_head, n_positions, n_layers,
-                   block_size, backend):
+                   block_size, backend, decode_backend,
+                   compare_to_ref, compare_tolerance):
     return PagedDecoderLM(
         n_vocab=n_vocab,
         n_embd=n_embd,
@@ -85,15 +92,19 @@ def _create_model(n_vocab, n_embd, n_head, n_positions, n_layers,
         block_size=block_size,
         p_dropout=0.0,
         backend=backend,
+        decode_backend=decode_backend,
+        compare_to_ref=compare_to_ref,
+        compare_tolerance=compare_tolerance,
     )
 
 
-def _create_block_manager(num_kv_blocks, block_size, n_head, head_dim):
+def _create_block_manager(num_kv_blocks, block_size, n_head, head_dim, n_layers):
     return BlockManager(
         num_blocks=num_kv_blocks,
         block_size=block_size,
         n_head=n_head,
         head_dim=head_dim,
+        num_layers=n_layers,
     )
 
 
@@ -271,6 +282,7 @@ def benchmark_max_batch_size(
             block_size=block_size,
             n_head=n_head,
             head_dim=head_dim,
+            num_layers=1,
         )
         try:
             for i in range(mid):
@@ -295,68 +307,105 @@ def _manual_attention(query, key, value, mask=None):
 
 
 def check_correctness(
-    n_head, head_dim, block_size, num_kv_blocks, backend,
+    n_vocab,
+    n_embd,
+    n_head,
+    n_layers,
+    n_positions,
+    block_size,
+    num_kv_blocks,
+    backend,
+    decode_backend,
+    compare_to_ref,
+    compare_tolerance,
 ) -> Dict[str, float]:
-    """Verify that paged attention matches standard attention.
+    """Verify the selected decode path against full-sequence recomputation."""
 
-    Creates random Q/K/V, populates a paged cache, and compares outputs
-    between numpy manual_attention and paged_attention_ref.
-    """
-    batch_size = 2
-    seq_len = 17  # Odd number to test partial blocks
-
-    np.random.seed(42)
-    q_np = np.random.randn(batch_size, n_head, 1, head_dim).astype(datatype)
-    keys_by_seq = [
-        np.random.randn(seq_len, n_head, head_dim).astype(datatype)
-        for _ in range(batch_size)
-    ]
-    values_by_seq = [
-        np.random.randn(seq_len, n_head, head_dim).astype(datatype)
-        for _ in range(batch_size)
-    ]
-
-    # Build paged cache (same approach as test suite)
-    total_blocks_needed = batch_size * ((seq_len + block_size - 1) // block_size)
-    key_cache = np.zeros((max(num_kv_blocks, total_blocks_needed),
-                          block_size, n_head, head_dim), dtype=datatype)
-    value_cache = np.zeros_like(key_cache)
-    block_tables = []
-    next_block_id = 0
-
-    for b in range(batch_size):
-        seq_block_ids = []
-        for start in range(0, seq_len, block_size):
-            end = min(start + block_size, seq_len)
-            key_cache[next_block_id, :end - start] = keys_by_seq[b][start:end]
-            value_cache[next_block_id, :end - start] = values_by_seq[b][start:end]
-            seq_block_ids.append(next_block_id)
-            next_block_id += 1
-        block_tables.append(seq_block_ids)
-
-    context_lens = [seq_len] * batch_size
-
-    # Paged attention output
-    q_t = tensor_from_numpy(q_np, backend=backend)
-    paged_out = paged_attention_ref(
-        q_t, key_cache, value_cache,
-        block_tables, context_lens,
-        block_size=block_size, n_head=n_head, head_dim=head_dim,
-    ).to_numpy()
-
-    # NumPy reference (per-batch, matches test approach)
-    expected_parts = []
-    for b in range(batch_size):
-        k_ref = keys_by_seq[b][None].transpose(0, 2, 1, 3)
-        v_ref = values_by_seq[b][None].transpose(0, 2, 1, 3)
-        expected_parts.append(
-            _manual_attention(q_np[b:b+1], k_ref, v_ref)
+    def _reference_last_logits(model, full_tokens_np, seq_ids):
+        ref_bm = _create_block_manager(
+            num_kv_blocks,
+            block_size,
+            n_head,
+            n_embd // n_head,
+            n_layers,
         )
-    expected = np.concatenate(expected_parts, axis=0)
+        ref_input = tensor_from_numpy(full_tokens_np.astype(datatype), backend=backend)
+        ref_logits = model.forward_prefill(ref_input, ref_bm, seq_ids)
+        return ref_logits.to_numpy()[:, -1, :]
 
-    max_abs_err = float(np.max(np.abs(paged_out - expected)))
-    mean_abs_err = float(np.mean(np.abs(paged_out - expected)))
-    matches = max_abs_err < 1e-4
+    batch_size = 2
+    prompt_len = min(7, n_positions - 2)
+    max_new_tokens = 3
+    np.random.seed(42)
+
+    model = _create_model(
+        n_vocab,
+        n_embd,
+        n_head,
+        n_positions,
+        n_layers,
+        block_size,
+        backend,
+        decode_backend,
+        compare_to_ref,
+        compare_tolerance,
+    )
+    model.eval()
+    block_manager = _create_block_manager(
+        num_kv_blocks,
+        block_size,
+        n_head,
+        n_embd // n_head,
+        n_layers,
+    )
+    seq_ids = list(range(batch_size))
+    prompt_np = np.random.randint(
+        0,
+        n_vocab,
+        size=(batch_size, prompt_len),
+    ).astype(datatype)
+    prompt = tensor_from_numpy(prompt_np, backend=backend)
+
+    generated = prompt_np.copy()
+    max_abs_err = 0.0
+    mean_abs_errs = []
+
+    logits = model.forward_prefill(prompt, block_manager, seq_ids)
+    logits_np = logits.to_numpy()[:, -1, :]
+    ref_logits_np = _reference_last_logits(model, generated, seq_ids)
+    diff = logits_np - ref_logits_np
+    max_abs_err = max(max_abs_err, float(np.max(np.abs(diff))))
+    mean_abs_errs.append(float(np.mean(np.abs(diff))))
+
+    next_tokens = np.argmax(logits_np, axis=-1).astype(datatype)
+    generated = np.concatenate([generated, next_tokens.reshape(batch_size, 1)], axis=1)
+
+    for step in range(1, max_new_tokens):
+        token_input = tensor_from_numpy(
+            next_tokens.reshape(batch_size, 1).astype(datatype),
+            backend=backend,
+        )
+        start_pos = prompt_len + step - 1
+        logits = model.forward_decode(
+            token_input,
+            block_manager,
+            seq_ids,
+            start_pos=start_pos,
+        )
+        logits_np = logits.to_numpy()[:, 0, :]
+        ref_logits_np = _reference_last_logits(model, generated, seq_ids)
+        diff = logits_np - ref_logits_np
+        max_abs_err = max(max_abs_err, float(np.max(np.abs(diff))))
+        mean_abs_errs.append(float(np.mean(np.abs(diff))))
+        next_tokens = np.argmax(logits_np, axis=-1).astype(datatype)
+        generated = np.concatenate([generated, next_tokens.reshape(batch_size, 1)], axis=1)
+
+    for seq_id in seq_ids:
+        if seq_id in block_manager.block_tables:
+            block_manager.free_sequence(seq_id)
+
+    mean_abs_err = float(np.mean(mean_abs_errs)) if mean_abs_errs else 0.0
+    matches = max_abs_err < compare_tolerance
 
     return {
         "correctness_pass": 1 if matches else 0,
@@ -400,7 +449,17 @@ def main():
         if not args.skip_correctness:
             print(f"[block_size={block_size}] Correctness check ... ", end="", flush=True)
             corr = check_correctness(
-                args.n_head, head_dim, block_size, args.num_kv_blocks, backend,
+                args.n_vocab,
+                args.n_embd,
+                args.n_head,
+                args.n_layers,
+                args.n_positions,
+                block_size,
+                args.num_kv_blocks,
+                backend,
+                args.decode_backend,
+                args.compare_to_ref,
+                args.compare_tolerance,
             )
             status = "PASS" if corr["correctness_pass"] else "FAIL"
             print(f"{status} (max_err={corr['max_abs_error']:.2e})")
@@ -436,10 +495,14 @@ def main():
                         args.n_vocab, args.n_embd, args.n_head,
                         args.n_positions, args.n_layers,
                         block_size, backend,
+                        args.decode_backend,
+                        args.compare_to_ref,
+                        args.compare_tolerance,
                     )
                     bm = _create_block_manager(
                         args.num_kv_blocks, block_size,
                         args.n_head, head_dim,
+                        args.n_layers,
                     )
                     prompt = _make_prompt(batch_size, seq_len, args.n_vocab, backend)
                     seq_ids = list(range(batch_size))
@@ -454,6 +517,7 @@ def main():
                     bm_frag = _create_block_manager(
                         args.num_kv_blocks, block_size,
                         args.n_head, head_dim,
+                        args.n_layers,
                     )
                     frag = benchmark_fragmentation(
                         bm_frag, batch_size, seq_len, block_size,

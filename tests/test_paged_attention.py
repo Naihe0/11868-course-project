@@ -110,13 +110,16 @@ class FakePagedAttentionModule:
         batch_size, seq_len, _, _ = x_heads.shape
 
         for batch_idx, seq_id in enumerate(seq_ids):
-            block_table = block_manager.allocate_blocks_for_sequence(seq_id, seq_len)
+            if seq_id not in block_manager.block_tables:
+                block_table = block_manager.allocate_blocks_for_sequence(seq_id, seq_len)
+            else:
+                block_table = block_manager.block_tables[seq_id]
             for logical_block_idx, block_id in enumerate(block_table.block_ids):
                 block = block_manager.blocks[block_id]
                 start = logical_block_idx * self.block_size
                 end = start + block.num_filled
-                block_manager.key_cache[block_id, : block.num_filled] = x_heads[batch_idx, start:end]
-                block_manager.value_cache[block_id, : block.num_filled] = x_heads[batch_idx, start:end]
+                block_manager.key_cache[0][block_id, : block.num_filled] = x_heads[batch_idx, start:end]
+                block_manager.value_cache[0][block_id, : block.num_filled] = x_heads[batch_idx, start:end]
 
         return to_tensor(x.to_numpy() * self.scale)
 
@@ -126,7 +129,16 @@ class FakePagedAttentionModule:
         for batch_idx, seq_id in enumerate(seq_ids):
             if seq_id not in block_manager.block_tables:
                 block_manager.allocate_blocks_for_sequence(seq_id, 0)
-            block_manager.write_token_kv(seq_id, x_heads[batch_idx], x_heads[batch_idx])
+            block_manager.append_token_to_sequence(seq_id)
+            token_index = block_manager.get_context_len(seq_id) - 1
+            block_id, slot_idx = block_manager.get_physical_location(seq_id, token_index)
+            block_manager.write_kv_slot(
+                block_id,
+                slot_idx,
+                x_heads[batch_idx],
+                x_heads[batch_idx],
+                layer=0,
+            )
 
         return to_tensor(x.to_numpy() * self.scale)
 
@@ -169,8 +181,8 @@ def merge_heads(x):
 
 def _cuda_available() -> bool:
     try:
-        import pycuda.autoinit  # noqa: F401
-        return True
+        import numba.cuda
+        return numba.cuda.is_available()
     except Exception:
         return False
 
@@ -183,6 +195,8 @@ def _kernel_available() -> bool:
         "minitorch", "cuda_kernels", "paged_attention.so",
     )
     if not os.path.exists(so_path):
+        return False
+    if not _cuda_available():
         return False
     try:
         import ctypes
@@ -425,7 +439,9 @@ class TestPagedMultiHeadAttention:
             block_size=block_size,
             n_head=n_head,
             head_dim=head_dim,
+            num_layers=1,
         )
+        block_manager.allocate_blocks_for_sequence(seq_id, seq_len)
 
         output = module.forward_prefill(x, block_manager, [seq_id])
 
@@ -442,10 +458,10 @@ class TestPagedMultiHeadAttention:
         np.testing.assert_allclose(output.to_numpy(), expected, atol=1e-5, rtol=1e-5)
         assert block_manager.context_lens[seq_id] == seq_len
         assert block_manager.block_tables[seq_id].block_ids == [0, 1]
-        np.testing.assert_allclose(block_manager.key_cache[0, :2], qkv_np[0, :, :2, :].transpose(1, 0, 2))
-        np.testing.assert_allclose(block_manager.key_cache[1, :1], qkv_np[0, :, 2:3, :].transpose(1, 0, 2))
-        np.testing.assert_allclose(block_manager.value_cache[0, :2], qkv_np[0, :, :2, :].transpose(1, 0, 2))
-        np.testing.assert_allclose(block_manager.value_cache[1, :1], qkv_np[0, :, 2:3, :].transpose(1, 0, 2))
+        np.testing.assert_allclose(block_manager.key_cache[0][0, :2], qkv_np[0, :, :2, :].transpose(1, 0, 2))
+        np.testing.assert_allclose(block_manager.key_cache[0][1, :1], qkv_np[0, :, 2:3, :].transpose(1, 0, 2))
+        np.testing.assert_allclose(block_manager.value_cache[0][0, :2], qkv_np[0, :, :2, :].transpose(1, 0, 2))
+        np.testing.assert_allclose(block_manager.value_cache[0][1, :1], qkv_np[0, :, 2:3, :].transpose(1, 0, 2))
 
     def test_forward_decode_appends_and_reads_cache(self, rng):
         n_head = 2
@@ -472,9 +488,12 @@ class TestPagedMultiHeadAttention:
             block_size=block_size,
             n_head=n_head,
             head_dim=head_dim,
+            num_layers=1,
         )
 
+        block_manager.allocate_blocks_for_sequence(seq_id, prompt_np.shape[1])
         module.forward_prefill(to_tensor(prompt_np), block_manager, [seq_id])
+        block_manager.append_token_to_sequence(seq_id)
         output = module.forward_decode(to_tensor(decode_np), block_manager, [seq_id])
 
         prompt_heads = np.transpose(
@@ -491,8 +510,8 @@ class TestPagedMultiHeadAttention:
         np.testing.assert_allclose(output.to_numpy(), expected, atol=1e-5, rtol=1e-5)
         assert block_manager.context_lens[seq_id] == 3
         assert block_manager.block_tables[seq_id].block_ids == [0, 1]
-        np.testing.assert_allclose(block_manager.key_cache[1, 0], decode_heads[0, :, 0, :])
-        np.testing.assert_allclose(block_manager.value_cache[1, 0], decode_heads[0, :, 0, :])
+        np.testing.assert_allclose(block_manager.key_cache[0][1, 0], decode_heads[0, :, 0, :])
+        np.testing.assert_allclose(block_manager.value_cache[0][1, 0], decode_heads[0, :, 0, :])
 
 
 # ---------------------------------------------------------------------------
@@ -521,6 +540,7 @@ class TestPagedTransformerLayer:
         block_manager = BlockManager(
             num_blocks=8, block_size=block_size,
             n_head=n_head, head_dim=head_dim,
+            num_layers=1,
         )
         x_np = rng.standard_normal((batch_size, seq_len, n_embd), dtype=np.float32)
         x = to_tensor(x_np)
@@ -548,6 +568,7 @@ class TestPagedTransformerLayer:
         block_manager = BlockManager(
             num_blocks=8, block_size=block_size,
             n_head=n_head, head_dim=head_dim,
+            num_layers=1,
         )
         # Prefill first
         prompt_np = rng.standard_normal((batch_size, 2, n_embd), dtype=np.float32)
@@ -577,6 +598,7 @@ class TestPagedTransformerLayer:
         block_manager = BlockManager(
             num_blocks=4, block_size=block_size,
             n_head=n_head, head_dim=head_dim,
+            num_layers=1,
         )
         x_np = rng.standard_normal((1, 3, n_embd), dtype=np.float32)
         x = to_tensor(x_np)
@@ -586,6 +608,42 @@ class TestPagedTransformerLayer:
 
 
 class TestPagedDecoderLM:
+    def test_forward_prefill_rejects_active_sequence(self, rng):
+        from minitorch.transformer import PagedDecoderLM
+        n_vocab = 10
+        n_embd = 6
+        n_head = 2
+        n_positions = 16
+        n_layers = 1
+        block_size = 4
+        model = PagedDecoderLM(
+            n_vocab=n_vocab,
+            n_embd=n_embd,
+            n_head=n_head,
+            n_positions=n_positions,
+            n_layers=n_layers,
+            block_size=block_size,
+            p_dropout=0.0,
+            backend=_test_backend,
+        )
+        model.token_embeddings = FakeTokenEmbedding(n_embd)
+        model.position_embeddings = FakePositionEmbedding(n_embd)
+        model.layers = [FakePagedAttentionModule(0.0, n_head, n_embd // n_head, block_size)]
+        model.ln = IdentityProjection()
+        model.lm_head = FakeLMHead(n_vocab)
+        block_manager = BlockManager(
+            num_blocks=16,
+            block_size=block_size,
+            n_head=n_head,
+            head_dim=n_embd // n_head,
+            num_layers=n_layers,
+        )
+        idx = to_tensor(rng.integers(0, n_vocab, size=(1, 3)).astype(np.float32))
+
+        model.forward_prefill(idx, block_manager, [7])
+        with pytest.raises(ValueError):
+            model.forward_prefill(idx, block_manager, [7])
+
     def test_generate_output_shape(self, rng):
         """Generate should produce (batch, prompt_len + max_new_tokens) tokens."""
         from minitorch.transformer import PagedDecoderLM
@@ -612,6 +670,7 @@ class TestPagedDecoderLM:
         block_manager = BlockManager(
             num_blocks=16, block_size=block_size,
             n_head=n_head, head_dim=n_embd // n_head,
+            num_layers=n_layers,
         )
         idx_np = rng.integers(0, n_vocab, size=(1, prompt_len)).astype(np.float32)
         idx = to_tensor(idx_np)
@@ -620,6 +679,41 @@ class TestPagedDecoderLM:
             model, idx, max_new_tokens, block_manager, [0], temperature=1.0,
         )
         assert result.shape == (1, prompt_len + max_new_tokens)
+
+    def test_generate_zero_new_tokens_returns_prompt_only(self, rng):
+        from minitorch.transformer import PagedDecoderLM
+        n_vocab = 10
+        n_embd = 6
+        n_head = 2
+        n_positions = 16
+        n_layers = 1
+        block_size = 4
+        prompt_len = 3
+
+        model = PagedDecoderLM(
+            n_vocab=n_vocab, n_embd=n_embd, n_head=n_head,
+            n_positions=n_positions, n_layers=n_layers,
+            block_size=block_size, p_dropout=0.0,
+            backend=_test_backend,
+        )
+        model.token_embeddings = FakeTokenEmbedding(n_embd)
+        model.position_embeddings = FakePositionEmbedding(n_embd)
+        model.layers = [FakePagedAttentionModule(0.0, n_head, n_embd // n_head, block_size)]
+        model.ln = IdentityProjection()
+        model.lm_head = FakeLMHead(n_vocab)
+        block_manager = BlockManager(
+            num_blocks=16, block_size=block_size,
+            n_head=n_head, head_dim=n_embd // n_head,
+            num_layers=n_layers,
+        )
+        idx_np = rng.integers(0, n_vocab, size=(1, prompt_len)).astype(np.float32)
+        idx = to_tensor(idx_np)
+
+        result = PagedDecoderLM.generate(
+            model, idx, 0, block_manager, [0], temperature=1.0,
+        )
+        np.testing.assert_allclose(result.to_numpy(), idx_np)
+        assert 0 not in block_manager.block_tables
 
     def test_generate_frees_sequences(self, rng):
         """After generate, the block manager should have freed the sequence."""
@@ -645,6 +739,7 @@ class TestPagedDecoderLM:
         block_manager = BlockManager(
             num_blocks=16, block_size=block_size,
             n_head=n_head, head_dim=n_embd // n_head,
+            num_layers=n_layers,
         )
         idx_np = rng.integers(0, n_vocab, size=(1, 2)).astype(np.float32)
         idx = to_tensor(idx_np)
@@ -654,6 +749,51 @@ class TestPagedDecoderLM:
         )
         # Sequence should be freed
         assert 42 not in block_manager.block_tables
+
+    def test_generate_frees_sequences_on_decode_error(self, rng):
+        from minitorch.transformer import PagedDecoderLM
+        n_vocab = 10
+        n_embd = 6
+        n_head = 2
+        n_positions = 16
+        n_layers = 1
+        block_size = 4
+        model = PagedDecoderLM(
+            n_vocab=n_vocab,
+            n_embd=n_embd,
+            n_head=n_head,
+            n_positions=n_positions,
+            n_layers=n_layers,
+            block_size=block_size,
+            p_dropout=0.0,
+            backend=_test_backend,
+        )
+        model.token_embeddings = FakeTokenEmbedding(n_embd)
+        model.position_embeddings = FakePositionEmbedding(n_embd)
+        model.layers = [FakePagedAttentionModule(0.0, n_head, n_embd // n_head, block_size)]
+        model.ln = IdentityProjection()
+        model.lm_head = FakeLMHead(n_vocab)
+        block_manager = BlockManager(
+            num_blocks=16,
+            block_size=block_size,
+            n_head=n_head,
+            head_dim=n_embd // n_head,
+            num_layers=n_layers,
+        )
+        idx = to_tensor(rng.integers(0, n_vocab, size=(1, 3)).astype(np.float32))
+
+        def _boom(*args, **kwargs):
+            raise RuntimeError("decode failed")
+
+        model.forward_decode = _boom
+
+        with pytest.raises(RuntimeError, match="decode failed"):
+            PagedDecoderLM.generate(
+                model, idx, 2, block_manager, [99], temperature=0.0,
+            )
+
+        assert 99 not in block_manager.block_tables
+        assert 99 not in block_manager.context_lens
 
 
 # ---------------------------------------------------------------------------

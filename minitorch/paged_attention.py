@@ -76,6 +76,7 @@ def paged_attention_ref(
     block_size: int = DEFAULT_BLOCK_SIZE,
     n_head: int = 8,
     head_dim: int = 64,
+    layer_id: int = 0,
 ) -> Tensor:
     """Reference Python implementation of PagedAttention.
 
@@ -100,6 +101,10 @@ def paged_attention_ref(
     Returns:
         Attention output (batch, n_head, 1, head_dim).
     """
+    if isinstance(key_cache, np.ndarray):
+        key_cache = [key_cache]
+        value_cache = [value_cache]
+
     outputs = []
     query_np = query.to_numpy()
 
@@ -112,8 +117,8 @@ def paged_attention_ref(
             logical_block_idx = token_idx // block_size
             slot_idx = token_idx % block_size
             block_id = block_table[logical_block_idx]
-            gathered_keys.append(key_cache[block_id, slot_idx])
-            gathered_values.append(value_cache[block_id, slot_idx])
+            gathered_keys.append(key_cache[layer_id][block_id, slot_idx])
+            gathered_values.append(value_cache[layer_id][block_id, slot_idx])
 
         key_np = np.stack(gathered_keys, axis=1).reshape(1, n_head, context_len, head_dim)
         value_np = np.stack(gathered_values, axis=1).reshape(1, n_head, context_len, head_dim)
@@ -281,6 +286,10 @@ class PagedMultiHeadAttention(Module):
         p_dropout: float = 0.1,
         bias: bool = True,
         backend: TensorBackend = None,
+        layer_id: int = 0,
+        decode_backend: str = "ref",
+        compare_to_ref: bool = False,
+        compare_tolerance: float = 1e-4,
     ):
         super().__init__()
         self.n_embd = n_embd
@@ -288,7 +297,13 @@ class PagedMultiHeadAttention(Module):
         self.head_dim = n_embd // n_head
         self.block_size = block_size
         self.backend = backend
-
+        self.layer_id = layer_id
+        if decode_backend not in {"ref", "cuda"}:
+            raise ValueError("decode_backend must be 'ref' or 'cuda'")
+        self.decode_backend = decode_backend
+        self.compare_to_ref = compare_to_ref
+        self.compare_tolerance = compare_tolerance
+        self.last_decode_compare: Optional[Dict[str, float]] = None
         # Projections
         # TODO: Initialize Q, K, V, Output linear projections
         #       (reuse modules_basic.Linear)
@@ -299,6 +314,54 @@ class PagedMultiHeadAttention(Module):
         self.v_proj = Linear(n_embd, n_embd, bias=bias, backend=backend)
         self.out_proj = Linear(n_embd, n_embd, bias=bias, backend=backend)
         self._kernel: Optional[PagedAttentionKernel] = None
+
+    def _decode_attention_ref(
+        self,
+        q: Tensor,
+        block_manager: BlockManager,
+        seq_ids: List[int],
+    ) -> Tensor:
+        block_tables = [
+            block_manager.block_tables[seq_id].block_ids for seq_id in seq_ids
+        ]
+        context_lens = [
+            block_manager.get_context_len(seq_id) for seq_id in seq_ids
+        ]
+        return paged_attention_ref(
+            q,
+            block_manager.key_cache,
+            block_manager.value_cache,
+            block_tables,
+            context_lens,
+            block_size=self.block_size,
+            n_head=self.n_head,
+            head_dim=self.head_dim,
+            layer_id=self.layer_id,
+        )
+
+    def _decode_attention_kernel(
+        self,
+        q: Tensor,
+        block_manager: BlockManager,
+        seq_ids: List[int],
+    ) -> Tensor:
+        if self._kernel is None:
+            self._kernel = PagedAttentionKernel()
+        block_tables = block_manager.get_block_table_array(seq_ids)
+        context_lens = np.array(
+            [block_manager.get_context_len(seq_id) for seq_id in seq_ids],
+            dtype=np.int32,
+        )
+        max_context_len = int(context_lens.max()) if len(context_lens) > 0 else 0
+        return self._kernel.forward(
+            q,
+            block_manager.get_key_cache(self.layer_id),
+            block_manager.get_value_cache(self.layer_id),
+            block_tables,
+            context_lens,
+            block_size=self.block_size,
+            max_context_len=max_context_len,
+        )
 
     # ----- Forward (prefill — standard attention) --------------------------
 
@@ -346,17 +409,16 @@ class PagedMultiHeadAttention(Module):
         v_cache_values = v.permute(0, 2, 1, 3).to_numpy()
 
         for batch_idx, seq_id in enumerate(seq_ids):
-            block_table = block_manager.allocate_blocks_for_sequence(seq_id, seq_len)
-
+            block_table = block_manager.block_tables[seq_id]
             for logical_block_idx, block_id in enumerate(block_table.block_ids):
                 block = block_manager.blocks[block_id]
                 start = logical_block_idx * self.block_size
                 end = start + block.num_filled
 
-                block_manager.key_cache[block_id, : block.num_filled, :, :] = (
+                block_manager.key_cache[self.layer_id][block_id, : block.num_filled, :, :] = (
                     k_cache_values[batch_idx, start:end, :, :]
                 )
-                block_manager.value_cache[block_id, : block.num_filled, :, :] = (
+                block_manager.value_cache[self.layer_id][block_id, : block.num_filled, :, :] = (
                     v_cache_values[batch_idx, start:end, :, :]
                 )
 
@@ -397,27 +459,38 @@ class PagedMultiHeadAttention(Module):
         v_new = v.permute(0, 2, 1, 3).to_numpy()[:, 0, :, :]
 
         for batch_idx, seq_id in enumerate(seq_ids):
-            if seq_id not in block_manager.block_tables:
-                block_manager.allocate_blocks_for_sequence(seq_id, 0)
-            block_manager.write_token_kv(seq_id, k_new[batch_idx], v_new[batch_idx])
+            block_table = block_manager.block_tables[seq_id]
+            token_index = block_manager.get_context_len(seq_id) - 1
+            block_id, slot_idx = block_manager.get_physical_location(seq_id, token_index)
+            block_manager.write_kv_slot(
+                block_id,
+                slot_idx,
+                k_new[batch_idx],
+                v_new[batch_idx],
+                layer=self.layer_id,
+            )
 
-        block_tables = [
-            block_manager.block_tables[seq_id].block_ids for seq_id in seq_ids
-        ]
-        context_lens = [
-            block_manager.get_context_len(seq_id) for seq_id in seq_ids
-        ]
-
-        output = paged_attention_ref(
-            q,
-            block_manager.key_cache,
-            block_manager.value_cache,
-            block_tables,
-            context_lens,
-            block_size=self.block_size,
-            n_head=self.n_head,
-            head_dim=self.head_dim,
-        )
+        if self.decode_backend == "cuda":
+            output = self._decode_attention_kernel(q, block_manager, seq_ids)
+            if self.compare_to_ref:
+                ref_output = self._decode_attention_ref(q, block_manager, seq_ids)
+                output_np = output.to_numpy()
+                ref_np = ref_output.to_numpy()
+                max_abs_error = float(np.max(np.abs(output_np - ref_np)))
+                mean_abs_error = float(np.mean(np.abs(output_np - ref_np)))
+                self.last_decode_compare = {
+                    "max_abs_error": max_abs_error,
+                    "mean_abs_error": mean_abs_error,
+                }
+                if max_abs_error > self.compare_tolerance:
+                    raise AssertionError(
+                        "CUDA paged attention mismatch: "
+                        f"max_abs_error={max_abs_error:.6f} "
+                        f"> tolerance={self.compare_tolerance:.6f}"
+                    )
+        else:
+            self.last_decode_compare = None
+            output = self._decode_attention_ref(q, block_manager, seq_ids)
         output = output.permute(0, 2, 1, 3).contiguous().view(
             batch_size * seq_len, self.n_embd
         )

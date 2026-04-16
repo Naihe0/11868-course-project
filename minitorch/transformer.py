@@ -73,6 +73,10 @@ class PagedTransformerLayer(Module):
         ln_eps: float = 1e-5,
         bias: bool = True,
         backend: TensorBackend = None,
+        layer_id: int = 0,
+        decode_backend: str = "ref",
+        compare_to_ref: bool = False,
+        compare_tolerance: float = 1e-4,
     ):
         super().__init__()
         self.ln_1 = LayerNorm1d(n_embd, ln_eps, backend)
@@ -80,6 +84,10 @@ class PagedTransformerLayer(Module):
         self.attention = PagedMultiHeadAttention(
             n_embd, n_head, block_size=block_size,
             p_dropout=p_dropout, bias=bias, backend=backend,
+            layer_id=layer_id,
+            decode_backend=decode_backend,
+            compare_to_ref=compare_to_ref,
+            compare_tolerance=compare_tolerance,
         )
         self.ff = FeedForward(
             n_embd, middle_dim=4 * n_embd,
@@ -149,6 +157,9 @@ class PagedDecoderLM(Module):
         ln_eps: float = 1e-5,
         bias: bool = True,
         backend: TensorBackend = None,
+        decode_backend: str = "ref",
+        compare_to_ref: bool = False,
+        compare_tolerance: float = 1e-4,
     ):
         super().__init__()
         self.backend = backend
@@ -161,14 +172,19 @@ class PagedDecoderLM(Module):
         self.position_embeddings = Embedding(n_positions, n_embd, backend)
 
         # Transformer layers
-        self.layers = [
-            PagedTransformerLayer(
+        self.layers = []
+        for layer_id in range(n_layers):
+            layer = PagedTransformerLayer(
                 n_embd, n_head, block_size=block_size,
                 p_dropout=p_dropout, ln_eps=ln_eps,
                 bias=bias, backend=backend,
+                layer_id=layer_id,
+                decode_backend=decode_backend,
+                compare_to_ref=compare_to_ref,
+                compare_tolerance=compare_tolerance,
             )
-            for _ in range(n_layers)
-        ]
+            setattr(self, f"layer_{layer_id}", layer)
+            self.layers.append(layer)
 
         # Output head
         self.dropout = Dropout(p_dropout)
@@ -214,7 +230,12 @@ class PagedDecoderLM(Module):
         """
         batch_size, seq_len = idx.shape
         x = self._embed(idx, start_pos=0)
-
+        for seq_id in seq_ids:
+            if seq_id in block_manager.block_tables:
+                raise ValueError(
+                    f"Sequence {seq_id} is already active; free it before prefill"
+                )
+            block_manager.allocate_blocks_for_sequence(seq_id, seq_len)
         for layer in self.layers:
             x = layer.forward_prefill(x, block_manager, seq_ids)
 
@@ -247,7 +268,10 @@ class PagedDecoderLM(Module):
         batch_size, seq_len = idx.shape
         assert seq_len == 1, "Decode processes one token at a time"
         x = self._embed(idx, start_pos=start_pos)
-
+        for seq_id in seq_ids:
+            if seq_id not in block_manager.block_tables:
+                block_manager.allocate_blocks_for_sequence(seq_id, 0)
+            block_manager.append_token_to_sequence(seq_id)
         for layer in self.layers:
             x = layer.forward_decode(x, block_manager, seq_ids)
 
@@ -282,13 +306,9 @@ class PagedDecoderLM(Module):
         model.eval()
         batch_size, prompt_len = idx.shape
         generated = idx.to_numpy().tolist()  # list of lists
-
         # 1. Prefill: process the full prompt
         logits = model.forward_prefill(idx, block_manager, seq_ids)
-        # Take logits at the last prompt position
-        last_logits_np = logits.to_numpy()[:, -1, :]  # (batch, n_vocab)
 
-        # 2. Sample next token from last position logits
         def _sample(logits_np: np.ndarray) -> np.ndarray:
             """Temperature-scaled sampling. Returns (batch,) int array."""
             if temperature <= 0:
@@ -301,29 +321,38 @@ class PagedDecoderLM(Module):
             ])
             return tokens
 
-        next_tokens = _sample(last_logits_np)  # (batch,)
-        for b in range(batch_size):
-            generated[b].append(int(next_tokens[b]))
+        try:
+            if max_new_tokens <= 0:
+                return tensor_from_numpy(
+                    np.array(generated, dtype=datatype),
+                    backend=model.backend,
+                )
 
-        # 3. Decode loop
-        for step in range(1, max_new_tokens):
-            # Build input tensor (batch, 1)
-            token_input = tensor_from_numpy(
-                next_tokens.reshape(batch_size, 1).astype(datatype),
-                backend=model.backend,
-            )
-            start_pos = prompt_len + step - 1
-            logits = model.forward_decode(
-                token_input, block_manager, seq_ids, start_pos=start_pos
-            )
-            logits_np = logits.to_numpy()[:, 0, :]  # (batch, n_vocab)
-            next_tokens = _sample(logits_np)
+            # 2. Sample next token from last prompt position logits
+            last_logits_np = logits.to_numpy()[:, -1, :]  # (batch, n_vocab)
+            next_tokens = _sample(last_logits_np)  # (batch,)
             for b in range(batch_size):
                 generated[b].append(int(next_tokens[b]))
 
-        # 4. Free sequences
-        for seq_id in seq_ids:
-            block_manager.free_sequence(seq_id)
+            # 3. Decode loop
+            for step in range(1, max_new_tokens):
+                # Build input tensor (batch, 1)
+                token_input = tensor_from_numpy(
+                    next_tokens.reshape(batch_size, 1).astype(datatype),
+                    backend=model.backend,
+                )
+                start_pos = prompt_len + step - 1
+                logits = model.forward_decode(
+                    token_input, block_manager, seq_ids, start_pos=start_pos
+                )
+                logits_np = logits.to_numpy()[:, 0, :]  # (batch, n_vocab)
+                next_tokens = _sample(logits_np)
+                for b in range(batch_size):
+                    generated[b].append(int(next_tokens[b]))
+        finally:
+            for seq_id in seq_ids:
+                if seq_id in block_manager.block_tables:
+                    block_manager.free_sequence(seq_id)
 
         return tensor_from_numpy(
             np.array(generated, dtype=datatype),
