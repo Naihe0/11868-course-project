@@ -14,4 +14,4 @@ nvcc -o minitorch/cuda_kernels/layernorm_kernel.so --shared src/layernorm_kernel
 # Use --cudart shared so the .so uses the process-wide libcudart.so instead of a
 # private static copy.  A static copy cannot see the GPU once numba.cuda (driver
 # API) has already initialised a context.
-nvcc -o minitorch/cuda_kernels/paged_attention.so --shared src/paged_attention.cu -Xcompiler -fPIC --cudart shared
+nvcc -std=c++17 -o minitorch/cuda_kernels/paged_attention.so --shared src/paged_attention.cu -Xcompiler -fPIC --cudart shared

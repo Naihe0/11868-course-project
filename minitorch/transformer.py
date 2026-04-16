@@ -281,6 +281,13 @@ class PagedDecoderLM(Module):
         )
         return logits
 
+    def close_decode_runtime(self) -> None:
+        for layer in self.layers:
+            if hasattr(layer, "attention") and hasattr(layer.attention, "close_decode_runtime"):
+                layer.attention.close_decode_runtime()
+            elif hasattr(layer, "close_decode_runtime"):
+                layer.close_decode_runtime()
+
     @staticmethod
     def generate(
         model: "PagedDecoderLM",
@@ -353,6 +360,7 @@ class PagedDecoderLM(Module):
             for seq_id in seq_ids:
                 if seq_id in block_manager.block_tables:
                     block_manager.free_sequence(seq_id)
+            model.close_decode_runtime()
 
         return tensor_from_numpy(
             np.array(generated, dtype=datatype),

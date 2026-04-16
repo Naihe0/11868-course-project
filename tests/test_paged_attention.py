@@ -28,6 +28,15 @@ from minitorch.tensor_functions import tensor_from_numpy
 from minitorch.tensor_ops import SimpleBackend
 
 _test_backend = SimpleBackend
+_full_model_backend = None
+
+
+def _get_full_model_backend():
+    global _full_model_backend
+    if _full_model_backend is None:
+        import minitorch
+        _full_model_backend = minitorch.TensorBackend(minitorch.FastOps)
+    return _full_model_backend
 
 
 def to_tensor(x: np.ndarray):
@@ -794,6 +803,85 @@ class TestPagedDecoderLM:
 
         assert 99 not in block_manager.block_tables
         assert 99 not in block_manager.context_lens
+
+    @pytest.mark.skipif(not _kernel_available(), reason="CUDA kernel not available")
+    def test_runtime_resync_after_reference_prefill(self, rng):
+        from minitorch.transformer import PagedDecoderLM
+
+        n_vocab = 64
+        n_embd = 16
+        n_head = 4
+        n_layers = 2
+        n_positions = 32
+        block_size = 4
+        batch_size = 2
+        prompt_len = 4
+        head_dim = n_embd // n_head
+
+        model = PagedDecoderLM(
+            n_vocab=n_vocab,
+            n_embd=n_embd,
+            n_head=n_head,
+            n_positions=n_positions,
+            n_layers=n_layers,
+            block_size=block_size,
+            p_dropout=0.0,
+            backend=_get_full_model_backend(),
+            decode_backend="cuda",
+            compare_to_ref=True,
+            compare_tolerance=1e-4,
+        )
+        model.eval()
+
+        actual_bm = BlockManager(
+            num_blocks=32,
+            block_size=block_size,
+            n_head=n_head,
+            head_dim=head_dim,
+            num_layers=n_layers,
+        )
+        ref_bm = BlockManager(
+            num_blocks=32,
+            block_size=block_size,
+            n_head=n_head,
+            head_dim=head_dim,
+            num_layers=n_layers,
+        )
+
+        seq_ids = list(range(batch_size))
+        prompt_np = rng.integers(0, n_vocab, size=(batch_size, prompt_len)).astype(np.float32)
+        prompt_t = tensor_from_numpy(prompt_np, backend=_get_full_model_backend())
+
+        # Populate runtime with the "actual" cache first.
+        model.forward_prefill(prompt_t, actual_bm, seq_ids)
+        # Then overwrite runtime caches by pre-filling a different manager on the same model.
+        model.forward_prefill(prompt_t, ref_bm, seq_ids)
+
+        # Decode should re-synchronize runtime with actual_bm before launching CUDA attention.
+        next_tokens_np = rng.integers(0, n_vocab, size=(batch_size, 1)).astype(np.float32)
+        next_tokens_t = tensor_from_numpy(next_tokens_np, backend=_get_full_model_backend())
+        for seq_id in seq_ids:
+            actual_bm.append_token_to_sequence(seq_id)
+
+        logits = model.forward_decode(
+            next_tokens_t,
+            actual_bm,
+            seq_ids,
+            start_pos=prompt_len,
+        )
+
+        assert logits.shape == (batch_size, 1, n_vocab)
+        for layer in model.layers:
+            compare = layer.attention.last_decode_compare
+            assert compare is not None
+            assert compare["max_abs_error"] <= layer.attention.compare_tolerance
+
+        for seq_id in seq_ids:
+            if seq_id in actual_bm.block_tables:
+                actual_bm.free_sequence(seq_id)
+            if seq_id in ref_bm.block_tables:
+                ref_bm.free_sequence(seq_id)
+        model.close_decode_runtime()
 
 
 # ---------------------------------------------------------------------------

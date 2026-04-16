@@ -57,6 +57,7 @@ __device__ float warp_reduce_max(float val) {
     return val;
 }
 
+
 // ---------------------------------------------------------------------------
 // PagedAttention Kernel (V1 — one thread-block per head per sequence)
 // ---------------------------------------------------------------------------
@@ -258,6 +259,248 @@ extern "C" {
     } \
 } while(0)
 
+struct PagedAttentionRuntime {
+    float* d_key_cache;
+    float* d_value_cache;
+    int* d_block_tables;
+    int* d_context_lens;
+    float* d_query;
+    float* d_output;
+
+    int num_blocks;
+    int block_size;
+    int n_head;
+    int head_dim;
+    int max_batch;
+    int max_blocks_per_seq;
+    int active_max_blocks_per_seq;
+};
+
+static inline int paged_attention_threads(int head_dim) {
+    int threads = head_dim;
+    if (threads < WARP_SIZE) threads = WARP_SIZE;
+    if (threads > 1024) threads = 1024;
+    return threads;
+}
+
+static inline size_t cache_numel(const PagedAttentionRuntime* runtime) {
+    return (size_t)runtime->num_blocks * runtime->block_size * runtime->n_head * runtime->head_dim;
+}
+
+static inline size_t query_numel(const PagedAttentionRuntime* runtime) {
+    return (size_t)runtime->max_batch * runtime->n_head * runtime->head_dim;
+}
+
+static inline size_t block_table_numel(const PagedAttentionRuntime* runtime) {
+    return (size_t)runtime->max_batch * runtime->max_blocks_per_seq;
+}
+
+void* paged_attention_runtime_create(
+    int num_blocks,
+    int block_size,
+    int n_head,
+    int head_dim,
+    int max_batch,
+    int max_blocks_per_seq
+) {
+    CUDA_CHECK(cudaSetDevice(0));
+
+    PagedAttentionRuntime* runtime = new PagedAttentionRuntime();
+    runtime->d_key_cache = nullptr;
+    runtime->d_value_cache = nullptr;
+    runtime->d_block_tables = nullptr;
+    runtime->d_context_lens = nullptr;
+    runtime->d_query = nullptr;
+    runtime->d_output = nullptr;
+
+    runtime->num_blocks = num_blocks;
+    runtime->block_size = block_size;
+    runtime->n_head = n_head;
+    runtime->head_dim = head_dim;
+    runtime->max_batch = max_batch;
+    runtime->max_blocks_per_seq = max_blocks_per_seq;
+    runtime->active_max_blocks_per_seq = max_blocks_per_seq;
+
+    size_t cache_bytes = cache_numel(runtime) * sizeof(float);
+    size_t query_bytes = query_numel(runtime) * sizeof(float);
+    size_t bt_bytes = block_table_numel(runtime) * sizeof(int);
+    size_t cl_bytes = (size_t)runtime->max_batch * sizeof(int);
+
+    CUDA_CHECK(cudaMalloc(&runtime->d_key_cache, cache_bytes));
+    CUDA_CHECK(cudaMalloc(&runtime->d_value_cache, cache_bytes));
+    CUDA_CHECK(cudaMalloc(&runtime->d_block_tables, bt_bytes));
+    CUDA_CHECK(cudaMalloc(&runtime->d_context_lens, cl_bytes));
+    CUDA_CHECK(cudaMalloc(&runtime->d_query, query_bytes));
+    CUDA_CHECK(cudaMalloc(&runtime->d_output, query_bytes));
+
+    return runtime;
+}
+
+void paged_attention_runtime_destroy(void* handle) {
+    if (handle == nullptr) return;
+
+    CUDA_CHECK(cudaSetDevice(0));
+
+    PagedAttentionRuntime* runtime = static_cast<PagedAttentionRuntime*>(handle);
+    cudaFree(runtime->d_key_cache);
+    cudaFree(runtime->d_value_cache);
+    cudaFree(runtime->d_block_tables);
+    cudaFree(runtime->d_context_lens);
+    cudaFree(runtime->d_query);
+    cudaFree(runtime->d_output);
+    delete runtime;
+}
+
+void paged_attention_runtime_upload_layer_cache(
+    void* handle,
+    const float* key_cache_host,
+    const float* value_cache_host
+) {
+    if (handle == nullptr) return;
+    CUDA_CHECK(cudaSetDevice(0));
+
+    PagedAttentionRuntime* runtime = static_cast<PagedAttentionRuntime*>(handle);
+    size_t cache_bytes = cache_numel(runtime) * sizeof(float);
+
+    CUDA_CHECK(cudaMemcpy(
+        runtime->d_key_cache,
+        key_cache_host,
+        cache_bytes,
+        cudaMemcpyHostToDevice
+    ));
+    CUDA_CHECK(cudaMemcpy(
+        runtime->d_value_cache,
+        value_cache_host,
+        cache_bytes,
+        cudaMemcpyHostToDevice
+    ));
+}
+
+void paged_attention_runtime_update_slot(
+    void* handle,
+    int block_id,
+    int slot_idx,
+    const float* key_host,
+    const float* value_host
+) {
+    if (handle == nullptr) return;
+    CUDA_CHECK(cudaSetDevice(0));
+
+    PagedAttentionRuntime* runtime = static_cast<PagedAttentionRuntime*>(handle);
+    size_t slot_elems = (size_t)runtime->n_head * runtime->head_dim;
+    size_t slot_offset = ((size_t)block_id * runtime->block_size + slot_idx) * slot_elems;
+    size_t slot_bytes = slot_elems * sizeof(float);
+
+    CUDA_CHECK(cudaMemcpy(
+        runtime->d_key_cache + slot_offset,
+        key_host,
+        slot_bytes,
+        cudaMemcpyHostToDevice
+    ));
+    CUDA_CHECK(cudaMemcpy(
+        runtime->d_value_cache + slot_offset,
+        value_host,
+        slot_bytes,
+        cudaMemcpyHostToDevice
+    ));
+}
+
+void paged_attention_runtime_update_metadata(
+    void* handle,
+    const int* block_tables_host,
+    const int* context_lens_host,
+    int batch_size,
+    int max_blocks_per_seq
+) {
+    if (handle == nullptr) return;
+    CUDA_CHECK(cudaSetDevice(0));
+
+    PagedAttentionRuntime* runtime = static_cast<PagedAttentionRuntime*>(handle);
+    if (batch_size > runtime->max_batch) {
+        fprintf(stderr, "paged_attention_runtime_update_metadata: batch_size=%d exceeds max_batch=%d\n",
+                batch_size, runtime->max_batch);
+        return;
+    }
+    if (max_blocks_per_seq > runtime->max_blocks_per_seq) {
+        fprintf(stderr, "paged_attention_runtime_update_metadata: max_blocks_per_seq=%d exceeds runtime capacity=%d\n",
+                max_blocks_per_seq, runtime->max_blocks_per_seq);
+        return;
+    }
+    runtime->active_max_blocks_per_seq = max_blocks_per_seq;
+
+    size_t bt_bytes = (size_t)batch_size * max_blocks_per_seq * sizeof(int);
+    size_t cl_bytes = (size_t)batch_size * sizeof(int);
+
+    CUDA_CHECK(cudaMemcpy(
+        runtime->d_block_tables,
+        block_tables_host,
+        bt_bytes,
+        cudaMemcpyHostToDevice
+    ));
+    CUDA_CHECK(cudaMemcpy(
+        runtime->d_context_lens,
+        context_lens_host,
+        cl_bytes,
+        cudaMemcpyHostToDevice
+    ));
+}
+
+void paged_attention_runtime_forward(
+    void* handle,
+    const float* query_host,
+    float* output_host,
+    int batch_size,
+    int max_context_len
+) {
+    if (handle == nullptr) return;
+    CUDA_CHECK(cudaSetDevice(0));
+
+    PagedAttentionRuntime* runtime = static_cast<PagedAttentionRuntime*>(handle);
+    if (batch_size > runtime->max_batch) {
+        fprintf(stderr, "paged_attention_runtime_forward: batch_size=%d exceeds max_batch=%d\n",
+                batch_size, runtime->max_batch);
+        return;
+    }
+
+    float scale = 1.0f / sqrtf((float)runtime->head_dim);
+    dim3 grid(batch_size, runtime->n_head);
+    int threads = paged_attention_threads(runtime->head_dim);
+    dim3 block(threads);
+    int num_warps = (threads + WARP_SIZE - 1) / WARP_SIZE;
+    size_t smem_bytes = (max_context_len + runtime->head_dim + num_warps) * sizeof(float);
+    size_t query_bytes = (size_t)batch_size * runtime->n_head * runtime->head_dim * sizeof(float);
+
+    CUDA_CHECK(cudaMemcpy(
+        runtime->d_query,
+        query_host,
+        query_bytes,
+        cudaMemcpyHostToDevice
+    ));
+
+    paged_attention_v1_kernel<<<grid, block, smem_bytes>>>(
+        runtime->d_output,
+        runtime->d_query,
+        runtime->d_key_cache,
+        runtime->d_value_cache,
+        runtime->d_block_tables,
+        runtime->d_context_lens,
+        runtime->block_size,
+        runtime->active_max_blocks_per_seq,
+        runtime->n_head,
+        runtime->head_dim,
+        scale
+    );
+    CUDA_CHECK(cudaGetLastError());
+    CUDA_CHECK(cudaDeviceSynchronize());
+
+    CUDA_CHECK(cudaMemcpy(
+        output_host,
+        runtime->d_output,
+        query_bytes,
+        cudaMemcpyDeviceToHost
+    ));
+}
+
 void paged_attention_forward(
     float* output,
     const float* query,
@@ -280,9 +523,7 @@ void paged_attention_forward(
     dim3 grid(batch_size, n_head);
     // Block: at least WARP_SIZE threads (needed for warp reductions),
     // up to head_dim if larger, capped at 1024.
-    int threads = head_dim;
-    if (threads < WARP_SIZE) threads = WARP_SIZE;
-    if (threads > 1024)      threads = 1024;
+    int threads = paged_attention_threads(head_dim);
     dim3 block(threads);
 
     // Dynamic shared memory: logits[max_context_len] + out_accum[head_dim]
