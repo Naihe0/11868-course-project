@@ -304,10 +304,6 @@ class PagedMultiHeadAttention(Module):
         self.compare_to_ref = compare_to_ref
         self.compare_tolerance = compare_tolerance
         self.last_decode_compare: Optional[Dict[str, float]] = None
-        # Projections
-        # TODO: Initialize Q, K, V, Output linear projections
-        #       (reuse modules_basic.Linear)
-
         # CUDA kernel handle (lazy-loaded)
         self.q_proj = Linear(n_embd, n_embd, bias=bias, backend=backend)
         self.k_proj = Linear(n_embd, n_embd, bias=bias, backend=backend)

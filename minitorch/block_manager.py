@@ -287,7 +287,6 @@ class BlockManager:
           3. Call `write_kv_slot`
           4. Return `(block_id, slot_idx)`
         """
-        # TODO: Implement append-and-write helper.
         block = self.append_token_to_sequence(seq_id)
         slot_idx = block.num_filled - 1
         self.write_kv_slot(block.block_id, slot_idx, key, value, layer)
