@@ -85,6 +85,7 @@ PagedAttention is a memory-efficient attention mechanism for LLM inference that 
 pip install -r requirements.txt
 
 # 3. Compile CUDA kernels
+module load cuda/12.4
 bash compile_cuda.sh
 
 # 4. Install the package in development mode
