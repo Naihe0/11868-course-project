@@ -248,6 +248,7 @@ class PagedDecoderLM(Module):
                     block_manager,
                     seq_ids,
                     prefix_token_count,
+                    cached_token_count=cached_token_count,
                     write_kv_to_cache=write_kv_to_cache,
                 )
                 norm_x = layer.ln_2(x.view(batch_size * work_len, n_embd)).view(
@@ -260,6 +261,7 @@ class PagedDecoderLM(Module):
                     block_manager,
                     seq_ids,
                     prefix_token_count,
+                    cached_token_count=cached_token_count,
                     write_kv_to_cache=write_kv_to_cache,
                 )
             else:

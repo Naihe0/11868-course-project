@@ -139,6 +139,7 @@ class FakePagedAttentionModule:
         seq_ids,
         prefix_token_count,
         *,
+        cached_token_count=None,
         write_kv_to_cache=True,
     ):
         x_heads = self._heads(x)
@@ -1187,6 +1188,138 @@ class TestPagedDecoderLM:
             if seq_id in ref_bm.block_tables:
                 ref_bm.free_sequence(seq_id)
         model.close_decode_runtime()
+
+    @pytest.mark.skipif(not _kernel_available(), reason="CUDA kernel not available")
+    def test_runtime_reuses_valid_blocks_within_same_manager(self, rng):
+        from minitorch.transformer import PagedDecoderLM
+
+        n_vocab = 32
+        n_embd = 16
+        n_head = 4
+        n_layers = 2
+        n_positions = 32
+        block_size = 4
+        prompt_len = 8
+        head_dim = n_embd // n_head
+
+        model = PagedDecoderLM(
+            n_vocab=n_vocab,
+            n_embd=n_embd,
+            n_head=n_head,
+            n_positions=n_positions,
+            n_layers=n_layers,
+            block_size=block_size,
+            p_dropout=0.0,
+            backend=_get_full_model_backend(),
+            decode_backend="cuda",
+        )
+        model.eval()
+
+        block_manager = BlockManager(
+            num_blocks=32,
+            block_size=block_size,
+            n_head=n_head,
+            head_dim=head_dim,
+            num_layers=n_layers,
+        )
+
+        prompt_np = rng.integers(0, n_vocab, size=(1, prompt_len)).astype(np.float32)
+        prompt_t = tensor_from_numpy(prompt_np, backend=_get_full_model_backend())
+
+        model.forward_prefill(prompt_t, block_manager, [11])
+        first_block_ids = list(block_manager.block_tables[11].block_ids)
+        layer_attn = model.layers[0].attention
+        assert set(first_block_ids).issubset(layer_attn._runtime_valid_block_ids)
+
+        upload_calls = []
+        original_upload_block = layer_attn._kernel.upload_block
+
+        def counting_upload_block(block_id, key_block, value_block):
+            upload_calls.append(block_id)
+            return original_upload_block(block_id, key_block, value_block)
+
+        layer_attn._kernel.upload_block = counting_upload_block
+        second_block_ids = None
+        try:
+            block_manager.free_sequence(11)
+            model.forward_prefill(prompt_t, block_manager, [12])
+            second_block_ids = list(block_manager.block_tables[12].block_ids)
+        finally:
+            layer_attn._kernel.upload_block = original_upload_block
+            if 12 in block_manager.block_tables:
+                block_manager.free_sequence(12)
+            model.close_decode_runtime()
+
+        assert upload_calls == []
+        assert second_block_ids is not None
+        assert second_block_ids == first_block_ids
+
+    @pytest.mark.skipif(not _kernel_available(), reason="CUDA kernel not available")
+    def test_runtime_reuploads_blocks_after_manager_switch(self, rng):
+        from minitorch.transformer import PagedDecoderLM
+
+        n_vocab = 32
+        n_embd = 16
+        n_head = 4
+        n_layers = 2
+        n_positions = 32
+        block_size = 4
+        prompt_len = 8
+        head_dim = n_embd // n_head
+
+        model = PagedDecoderLM(
+            n_vocab=n_vocab,
+            n_embd=n_embd,
+            n_head=n_head,
+            n_positions=n_positions,
+            n_layers=n_layers,
+            block_size=block_size,
+            p_dropout=0.0,
+            backend=_get_full_model_backend(),
+            decode_backend="cuda",
+        )
+        model.eval()
+
+        manager_a = BlockManager(
+            num_blocks=32,
+            block_size=block_size,
+            n_head=n_head,
+            head_dim=head_dim,
+            num_layers=n_layers,
+        )
+        manager_b = BlockManager(
+            num_blocks=32,
+            block_size=block_size,
+            n_head=n_head,
+            head_dim=head_dim,
+            num_layers=n_layers,
+        )
+
+        prompt_np = rng.integers(0, n_vocab, size=(1, prompt_len)).astype(np.float32)
+        prompt_t = tensor_from_numpy(prompt_np, backend=_get_full_model_backend())
+
+        model.forward_prefill(prompt_t, manager_a, [21])
+        layer_attn = model.layers[0].attention
+
+        upload_calls = []
+        original_upload_block = layer_attn._kernel.upload_block
+
+        def counting_upload_block(block_id, key_block, value_block):
+            upload_calls.append(block_id)
+            return original_upload_block(block_id, key_block, value_block)
+
+        layer_attn._kernel.upload_block = counting_upload_block
+        try:
+            model.forward_prefill(prompt_t, manager_b, [22])
+        finally:
+            layer_attn._kernel.upload_block = original_upload_block
+            if 21 in manager_a.block_tables:
+                manager_a.free_sequence(21)
+            if 22 in manager_b.block_tables:
+                manager_b.free_sequence(22)
+            model.close_decode_runtime()
+
+        assert upload_calls != []
 
 
 # ---------------------------------------------------------------------------
