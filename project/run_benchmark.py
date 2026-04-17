@@ -16,6 +16,7 @@ Usage:
 
 import argparse
 import csv
+import math
 import os
 import sys
 import time
@@ -28,7 +29,7 @@ sys.path.insert(0, ".")
 
 import minitorch
 from minitorch.transformer import PagedDecoderLM
-from minitorch.block_manager import BlockManager
+from minitorch.block_manager import BlockManager, CACHE_DTYPE
 from minitorch.paged_attention import paged_attention_ref
 from minitorch.tensor import tensor_from_numpy
 from minitorch.modules_transfomer import DecoderLM
@@ -67,6 +68,12 @@ def parse_args():
     parser.add_argument("--compare-baseline", action="store_true",
                         help="Also benchmark the non-paged DecoderLM (hw3/hw4) "
                              "for throughput comparison")
+    parser.add_argument("--compare-prefix-cache", action="store_true",
+                        help="Benchmark second-request prefill when the prompt "
+                             "shares a prefix with a previously cached request")
+    parser.add_argument("--prefix-shared-ratio", type=float, default=0.5,
+                        help="Fraction of each prompt to reuse in the prefix-cache "
+                             "benchmark. Rounded down to full blocks.")
     return parser.parse_args()
 
 
@@ -113,8 +120,17 @@ def _make_prompt(batch_size, seq_len, n_vocab, backend):
     return tensor_from_numpy(prompt_np, backend=backend)
 
 
-def _create_baseline_model(n_vocab, n_embd, n_head, n_positions, backend):
-    """Create a non-paged DecoderLM (hw3/hw4 baseline, always 4 layers)."""
+def _create_baseline_model(n_vocab, n_embd, n_head, n_positions, n_layers, backend):
+    """Create a non-paged DecoderLM baseline.
+
+    The reference DecoderLM in this repo is fixed to 4 transformer layers.
+    We only benchmark it when the requested paged model is also 4 layers so the
+    comparison remains structurally fair.
+    """
+    if n_layers != 4:
+        raise ValueError(
+            "Baseline DecoderLM is only available for n_layers=4 in this repo"
+        )
     return DecoderLM(
         n_vocab=n_vocab,
         n_embd=n_embd,
@@ -123,6 +139,40 @@ def _create_baseline_model(n_vocab, n_embd, n_head, n_positions, backend):
         p_dropout=0.0,
         backend=backend,
     )
+
+
+def _kv_cache_metrics(block_manager: BlockManager) -> Dict[str, float]:
+    """Summarize reserved/used KV cache capacity for the current manager state."""
+    dtype_size = np.dtype(block_manager.cache_dtype).itemsize
+    reserved_token_slots = block_manager.num_blocks * block_manager.block_size
+    used_token_slots = sum(block.num_filled for block in block_manager.blocks.values())
+    kv_reserved_bytes = (
+        block_manager.num_blocks
+        * block_manager.block_size
+        * block_manager.n_head
+        * block_manager.head_dim
+        * block_manager.num_layers
+        * 2
+        * dtype_size
+    )
+    kv_used_bytes = (
+        used_token_slots
+        * block_manager.n_head
+        * block_manager.head_dim
+        * block_manager.num_layers
+        * 2
+        * dtype_size
+    )
+    kv_efficiency = (
+        kv_used_bytes / kv_reserved_bytes if kv_reserved_bytes > 0 else 0.0
+    )
+    return {
+        "reserved_token_slots": int(reserved_token_slots),
+        "used_token_slots": int(used_token_slots),
+        "kv_reserved_bytes": int(kv_reserved_bytes),
+        "kv_used_bytes": int(kv_used_bytes),
+        "kv_efficiency": round(kv_efficiency, 4),
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -170,11 +220,13 @@ def benchmark_throughput(
     total_generated = batch_size * max_new_tokens
     decode_tokens = batch_size * (max_new_tokens - 1) if max_new_tokens > 1 else 0
 
+    kv_metrics = _kv_cache_metrics(block_manager)
+
     # Free sequences for reuse
     for seq_id in seq_ids:
         block_manager.free_sequence(seq_id)
 
-    return {
+    metrics = {
         "total_time_s": round(total_time, 4),
         "prefill_time_s": round(prefill_time, 4),
         "decode_time_s": round(decode_time, 4),
@@ -182,45 +234,205 @@ def benchmark_throughput(
         "decode_tokens_per_sec": round(decode_tokens / decode_time, 2) if decode_time > 0 else 0,
         "time_per_token_ms": round((decode_time / decode_tokens) * 1000, 2) if decode_tokens > 0 else 0,
     }
+    metrics.update(kv_metrics)
+    return metrics
 
 
 def benchmark_baseline_throughput(
-    model, prompt, max_new_tokens, n_vocab, backend,
+    model, prompt, max_new_tokens, backend,
 ) -> Dict[str, float]:
-    """Measure generation throughput for the non-paged baseline DecoderLM.
+    """Measure prompt+generation throughput for the non-paged baseline DecoderLM.
 
     The baseline has no KV cache, so autoregressive generation feeds the
     *entire* accumulated sequence through forward() at each step.
 
-    Returns dict with: baseline_total_time_s, baseline_tokens_per_sec,
-                       baseline_time_per_token_ms
+    Returns dict with:
+      - baseline_prefill_time_s
+      - baseline_decode_time_s
+      - baseline_total_time_s
+      - baseline_tokens_per_sec
+      - baseline_decode_tokens_per_sec
+      - baseline_time_per_token_ms
     """
     batch_size, seq_len = prompt.shape
-    # Start with prompt tokens as lists
     generated_np = prompt.to_numpy().astype(datatype)
 
     model.eval()
-    start = time.perf_counter()
+    prefill_start = time.perf_counter()
+    prompt_logits = model.forward(prompt)
+    prefill_end = time.perf_counter()
+    prefill_time = prefill_end - prefill_start
 
-    for step in range(max_new_tokens):
-        # Feed entire sequence so far
+    if max_new_tokens <= 0:
+        return {
+            "baseline_prefill_time_s": round(prefill_time, 4),
+            "baseline_decode_time_s": 0.0,
+            "baseline_total_time_s": round(prefill_time, 4),
+            "baseline_tokens_per_sec": 0.0,
+            "baseline_decode_tokens_per_sec": 0.0,
+            "baseline_time_per_token_ms": 0.0,
+        }
+
+    last_logits = prompt_logits.to_numpy()[:, -1, :]
+    next_tokens = np.argmax(last_logits, axis=-1).astype(datatype)
+    generated_np = np.concatenate(
+        [generated_np, next_tokens.reshape(batch_size, 1)],
+        axis=1,
+    )
+
+    decode_start = time.perf_counter()
+    for _ in range(1, max_new_tokens):
         input_t = tensor_from_numpy(generated_np, backend=backend)
         logits = model.forward(input_t)
-        # Greedy: take argmax at last position
         last_logits = logits.to_numpy()[:, -1, :]
         next_tokens = np.argmax(last_logits, axis=-1).astype(datatype)
         generated_np = np.concatenate(
-            [generated_np, next_tokens.reshape(batch_size, 1)], axis=1,
+            [generated_np, next_tokens.reshape(batch_size, 1)],
+            axis=1,
         )
+    decode_end = time.perf_counter()
 
-    end = time.perf_counter()
-    total_time = end - start
+    decode_time = decode_end - decode_start
+    total_time = prefill_time + decode_time
     total_generated = batch_size * max_new_tokens
+    decode_tokens = batch_size * max(max_new_tokens - 1, 0)
 
     return {
+        "baseline_prefill_time_s": round(prefill_time, 4),
+        "baseline_decode_time_s": round(decode_time, 4),
         "baseline_total_time_s": round(total_time, 4),
         "baseline_tokens_per_sec": round(total_generated / total_time, 2) if total_time > 0 else 0,
-        "baseline_time_per_token_ms": round((total_time / total_generated) * 1000, 2) if total_generated > 0 else 0,
+        "baseline_decode_tokens_per_sec": round(decode_tokens / decode_time, 2) if decode_time > 0 else 0,
+        "baseline_time_per_token_ms": round((decode_time / decode_tokens) * 1000, 2) if decode_tokens > 0 else 0,
+        "baseline_kv_reserved_bytes": 0,
+        "baseline_kv_used_bytes": 0,
+    }
+
+
+def benchmark_prefix_cache_prefill(
+    n_vocab,
+    n_embd,
+    n_head,
+    n_layers,
+    n_positions,
+    num_kv_blocks,
+    block_size,
+    seq_len,
+    backend,
+    decode_backend,
+    compare_to_ref,
+    compare_tolerance,
+    shared_ratio: float,
+) -> Dict[str, float]:
+    """Measure prefill savings for a second request with a shared prefix."""
+    if seq_len < block_size:
+        return {
+            "prefix_cached_tokens": 0,
+            "prefix_cached_blocks": 0,
+            "prefix_hit_rate": 0.0,
+            "prefix_cached_prefill_time_s": 0.0,
+            "prefix_fresh_prefill_time_s": 0.0,
+            "prefix_prefill_speedup": 0.0,
+        }
+
+    head_dim = n_embd // n_head
+    shared_blocks = int((seq_len * shared_ratio) // block_size)
+    shared_tokens = shared_blocks * block_size
+    if shared_tokens <= 0:
+        return {
+            "prefix_cached_tokens": 0,
+            "prefix_cached_blocks": 0,
+            "prefix_hit_rate": 0.0,
+            "prefix_cached_prefill_time_s": 0.0,
+            "prefix_fresh_prefill_time_s": 0.0,
+            "prefix_prefill_speedup": 0.0,
+        }
+
+    model = _create_model(
+        n_vocab,
+        n_embd,
+        n_head,
+        n_positions,
+        n_layers,
+        block_size,
+        backend,
+        decode_backend,
+        compare_to_ref,
+        compare_tolerance,
+    )
+    model.eval()
+
+    cached_manager = _create_block_manager(
+        num_kv_blocks,
+        block_size,
+        n_head,
+        head_dim,
+        n_layers,
+    )
+    fresh_manager = _create_block_manager(
+        num_kv_blocks,
+        block_size,
+        n_head,
+        head_dim,
+        n_layers,
+    )
+
+    base_prompt = np.random.randint(0, n_vocab, size=(1, seq_len)).astype(datatype)
+    second_prompt = base_prompt.copy()
+    if shared_tokens < seq_len:
+        second_prompt[:, shared_tokens:] = np.random.randint(
+            0, n_vocab, size=(1, seq_len - shared_tokens)
+        ).astype(datatype)
+
+    model.forward_prefill(
+        tensor_from_numpy(base_prompt, backend=backend),
+        cached_manager,
+        [9000],
+    )
+    cached_manager.free_sequence(9000)
+
+    second_prompt_t = tensor_from_numpy(second_prompt, backend=backend)
+
+    cached_start = time.perf_counter()
+    cached_logits = model.forward_prefill(second_prompt_t, cached_manager, [9001])
+    cached_end = time.perf_counter()
+    cached_prefill_time = cached_end - cached_start
+    cached_hit_tokens = cached_manager.seq_prefix_cache_info[9001].cached_token_count
+
+    fresh_start = time.perf_counter()
+    fresh_logits = model.forward_prefill(second_prompt_t, fresh_manager, [9101])
+    fresh_end = time.perf_counter()
+    fresh_prefill_time = fresh_end - fresh_start
+
+    if cached_hit_tokens < seq_len:
+        np.testing.assert_allclose(
+            cached_logits.to_numpy()[:, cached_hit_tokens:, :],
+            fresh_logits.to_numpy()[:, cached_hit_tokens:, :],
+            atol=1e-5,
+            rtol=1e-5,
+        )
+    else:
+        np.testing.assert_allclose(
+            cached_logits.to_numpy()[:, -1:, :],
+            fresh_logits.to_numpy()[:, -1:, :],
+            atol=1e-5,
+            rtol=1e-5,
+        )
+
+    cached_manager.free_sequence(9001)
+    fresh_manager.free_sequence(9101)
+    model.close_decode_runtime()
+
+    return {
+        "prefix_cached_tokens": int(cached_hit_tokens),
+        "prefix_cached_blocks": int(cached_hit_tokens // block_size),
+        "prefix_hit_rate": round(cached_hit_tokens / seq_len, 4),
+        "prefix_cached_prefill_time_s": round(cached_prefill_time, 4),
+        "prefix_fresh_prefill_time_s": round(fresh_prefill_time, 4),
+        "prefix_prefill_speedup": round(
+            (fresh_prefill_time / cached_prefill_time) if cached_prefill_time > 0 else 0.0,
+            2,
+        ),
     }
 
 
@@ -533,31 +745,69 @@ def main():
                         try:
                             baseline_model = _create_baseline_model(
                                 args.n_vocab, args.n_embd, args.n_head,
-                                args.n_positions, backend,
-                            )
-                            baseline_prompt = _make_prompt(
-                                batch_size, seq_len, args.n_vocab, backend,
+                                args.n_positions, args.n_layers, backend,
                             )
                             baseline_info = benchmark_baseline_throughput(
-                                baseline_model, baseline_prompt,
-                                args.max_new_tokens, args.n_vocab, backend,
+                                baseline_model,
+                                prompt,
+                                args.max_new_tokens,
+                                backend,
                             )
-                            speedup = (baseline_info["baseline_time_per_token_ms"]
-                                       / throughput["time_per_token_ms"]
-                                       if throughput["time_per_token_ms"] > 0
-                                       else 0)
-                            baseline_info["speedup_vs_baseline"] = round(speedup, 2)
+                            total_speedup = (
+                                baseline_info["baseline_total_time_s"] / throughput["total_time_s"]
+                                if throughput["total_time_s"] > 0
+                                else 0
+                            )
+                            decode_speedup = (
+                                baseline_info["baseline_time_per_token_ms"] / throughput["time_per_token_ms"]
+                                if throughput["time_per_token_ms"] > 0
+                                else 0
+                            )
+                            baseline_info["total_speedup_vs_baseline"] = round(total_speedup, 2)
+                            baseline_info["decode_speedup_vs_baseline"] = round(decode_speedup, 2)
                         except Exception as e:
                             print(f"\n    Baseline error: {e}")
+
+                    prefix_info = {}
+                    if args.compare_prefix_cache:
+                        try:
+                            prefix_info = benchmark_prefix_cache_prefill(
+                                args.n_vocab,
+                                args.n_embd,
+                                args.n_head,
+                                args.n_layers,
+                                args.n_positions,
+                                args.num_kv_blocks,
+                                block_size,
+                                seq_len,
+                                backend,
+                                args.decode_backend,
+                                args.compare_to_ref,
+                                args.compare_tolerance,
+                                args.prefix_shared_ratio,
+                            )
+                        except Exception as e:
+                            print(f"\n    Prefix-cache error: {e}")
+                    result.update(prefix_info)
                     result.update(baseline_info)
                     all_results.append(result)
 
                     msg = (f"OK  {throughput['tokens_per_sec']:.1f} tok/s, "
                            f"int_frag={frag['internal_frag']:.3f}, "
-                           f"decode={throughput['time_per_token_ms']:.1f}ms/tok")
+                           f"decode={throughput['time_per_token_ms']:.1f}ms/tok, "
+                           f"kv_eff={throughput['kv_efficiency']:.3f}")
                     if baseline_info:
-                        msg += (f" | baseline={baseline_info['baseline_time_per_token_ms']:.1f}ms/tok"
-                                f" speedup={baseline_info.get('speedup_vs_baseline', 0):.2f}x")
+                        msg += (
+                            f" | baseline total={baseline_info['baseline_total_time_s']:.3f}s"
+                            f" decode={baseline_info['baseline_time_per_token_ms']:.1f}ms/tok"
+                            f" total_spd={baseline_info.get('total_speedup_vs_baseline', 0):.2f}x"
+                            f" decode_spd={baseline_info.get('decode_speedup_vs_baseline', 0):.2f}x"
+                        )
+                    if prefix_info:
+                        msg += (
+                            f" | prefix_hit={prefix_info['prefix_cached_tokens']}"
+                            f" prefill_spd={prefix_info['prefix_prefill_speedup']:.2f}x"
+                        )
                     print(msg)
 
                 except Exception as e:
@@ -593,23 +843,39 @@ def main():
         print("SUMMARY")
         print("=" * 70)
         has_baseline = any("baseline_tokens_per_sec" in r for r in all_results)
+        has_prefix = any("prefix_prefill_speedup" in r for r in all_results)
         header = (f"{'BS':>3} {'Batch':>5} {'SeqLen':>6} "
                   f"{'tok/s':>8} {'ms/tok':>8} "
-                  f"{'IntFrag':>8} {'Util':>6}")
+                  f"{'IntFrag':>8} {'Util':>6} {'KVeff':>6}")
         if has_baseline:
-            header += f"  {'BL ms/tok':>9} {'Speedup':>7}"
+            header += (
+                f"  {'BL tok/s':>8} {'BL ms/tok':>9}"
+                f" {'TotSpd':>7} {'DecSpd':>7}"
+            )
+        if has_prefix:
+            header += f" {'PHit':>5} {'PSpd':>6}"
         print(header)
-        print("-" * (70 if not has_baseline else 90))
+        print("-" * (70 if not has_baseline and not has_prefix else 128))
         for r in all_results:
             row = (f"{r['block_size']:>3} {r['batch_size']:>5} "
                    f"{r['seq_len']:>6} "
                    f"{r['tokens_per_sec']:>8.1f} "
                    f"{r['time_per_token_ms']:>8.1f} "
                    f"{r['internal_frag']:>8.4f} "
-                   f"{r['utilization']:>6.3f}")
+                   f"{r['utilization']:>6.3f} "
+                   f"{r['kv_efficiency']:>6.3f}")
             if has_baseline and "baseline_time_per_token_ms" in r:
-                row += (f"  {r['baseline_time_per_token_ms']:>9.1f} "
-                        f"{r.get('speedup_vs_baseline', 0):>6.2f}x")
+                row += (
+                    f"  {r['baseline_tokens_per_sec']:>8.1f}"
+                    f" {r['baseline_time_per_token_ms']:>9.1f}"
+                    f" {r.get('total_speedup_vs_baseline', 0):>6.2f}x"
+                    f" {r.get('decode_speedup_vs_baseline', 0):>6.2f}x"
+                )
+            if has_prefix and "prefix_prefill_speedup" in r:
+                row += (
+                    f" {r['prefix_cached_tokens']:>5}"
+                    f" {r['prefix_prefill_speedup']:>5.2f}x"
+                )
             print(row)
 
 

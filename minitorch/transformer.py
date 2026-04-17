@@ -212,6 +212,71 @@ class PagedDecoderLM(Module):
         pos_emb = self.position_embeddings(pos_ids)
         return self.dropout(tok_emb + pos_emb)
 
+    def _forward_prefill_group_with_prefix(
+        self,
+        idx,
+        block_manager: BlockManager,
+        seq_ids: List[int],
+        cached_token_count: int,
+    ):
+        """Run prefix-aware prefill for a group sharing one prefix length."""
+        batch_size, seq_len = idx.shape
+        if batch_size != len(seq_ids):
+            raise ValueError("Batch size must match seq_ids length")
+        if seq_len <= 0:
+            raise ValueError("Prefill expects at least one prompt token")
+
+        work_start = cached_token_count if cached_token_count < seq_len else seq_len - 1
+        write_kv_to_cache = cached_token_count < seq_len
+        idx_np = idx.to_numpy()
+        idx_work = tensor_from_numpy(
+            idx_np[:, work_start:].astype(np.float32),
+            backend=self.backend,
+        )
+
+        x = self._embed(idx_work, start_pos=work_start)
+        prefix_token_count = work_start
+
+        for layer in self.layers:
+            if hasattr(layer, "attention") and hasattr(layer.attention, "forward_prefill_with_prefix_batch"):
+                batch_size, work_len, n_embd = x.shape
+                norm_x = layer.ln_1(x.view(batch_size * work_len, n_embd)).view(
+                    batch_size, work_len, n_embd
+                )
+                x = x + layer.attention.forward_prefill_with_prefix_batch(
+                    norm_x,
+                    block_manager,
+                    seq_ids,
+                    prefix_token_count,
+                    write_kv_to_cache=write_kv_to_cache,
+                )
+                norm_x = layer.ln_2(x.view(batch_size * work_len, n_embd)).view(
+                    batch_size, work_len, n_embd
+                )
+                x = x + layer.ff(norm_x)
+            elif hasattr(layer, "forward_prefill_with_prefix_batch"):
+                x = layer.forward_prefill_with_prefix_batch(
+                    x,
+                    block_manager,
+                    seq_ids,
+                    prefix_token_count,
+                    write_kv_to_cache=write_kv_to_cache,
+                )
+            else:
+                x = layer.forward_prefill(x, block_manager, seq_ids)
+
+        batch_size, work_len, _ = x.shape
+        x = self.ln(x.view(batch_size * work_len, self.n_embd)).view(
+            batch_size, work_len, self.n_embd
+        )
+        logits_work = self.lm_head(
+            x.view(batch_size * work_len, self.n_embd)
+        ).view(batch_size, work_len, self.n_vocab)
+
+        logits_np = np.zeros((batch_size, seq_len, self.n_vocab), dtype=np.float32)
+        logits_np[:, work_start:, :] = logits_work.to_numpy()
+        return tensor_from_numpy(logits_np, backend=self.backend)
+
     def forward_prefill(
         self,
         idx,
@@ -229,23 +294,92 @@ class PagedDecoderLM(Module):
             Logits (batch, seq_len, n_vocab).
         """
         batch_size, seq_len = idx.shape
-        x = self._embed(idx, start_pos=0)
-        for seq_id in seq_ids:
+        idx_np = idx.to_numpy().astype(np.int32)
+
+        prefix_matches = []
+        for batch_idx, seq_id in enumerate(seq_ids):
             if seq_id in block_manager.block_tables:
                 raise ValueError(
                     f"Sequence {seq_id} is already active; free it before prefill"
                 )
-            block_manager.allocate_blocks_for_sequence(seq_id, seq_len)
-        for layer in self.layers:
-            x = layer.forward_prefill(x, block_manager, seq_ids)
+            seq_tokens = idx_np[batch_idx]
+            match = block_manager.lookup_prefix_blocks(seq_tokens)
+            prefix_matches.append(match)
+            if match.block_ids:
+                block_manager.allocate_sequence_with_prefix(
+                    seq_id,
+                    seq_len,
+                    match.block_ids,
+                )
+            else:
+                block_manager.allocate_blocks_for_sequence(seq_id, seq_len)
 
-        x = self.ln(x.view(batch_size * seq_len, self.n_embd)).view(
-            batch_size, seq_len, self.n_embd
-        )
-        logits = self.lm_head(
-            x.view(batch_size * seq_len, self.n_embd)
-        ).view(batch_size, seq_len, self.n_vocab)
-        return logits
+        if all(match.cached_token_count == 0 for match in prefix_matches):
+            x = self._embed(idx, start_pos=0)
+            for layer in self.layers:
+                x = layer.forward_prefill(x, block_manager, seq_ids)
+
+            for batch_idx, seq_id in enumerate(seq_ids):
+                # Publish only after all layers have finished populating K/V so the
+                # cached prefix is fully materialized across the whole network.
+                block_manager.publish_sequence_prefix_blocks(seq_id, idx_np[batch_idx])
+
+            x = self.ln(x.view(batch_size * seq_len, self.n_embd)).view(
+                batch_size, seq_len, self.n_embd
+            )
+            logits = self.lm_head(
+                x.view(batch_size * seq_len, self.n_embd)
+            ).view(batch_size, seq_len, self.n_vocab)
+            return logits
+
+        logits_np = np.zeros((batch_size, seq_len, self.n_vocab), dtype=np.float32)
+
+        no_hit_indices = [
+            batch_idx
+            for batch_idx, match in enumerate(prefix_matches)
+            if match.cached_token_count == 0
+        ]
+        if no_hit_indices:
+            idx_no_hit = tensor_from_numpy(
+                idx_np[no_hit_indices].astype(np.float32),
+                backend=self.backend,
+            )
+            seq_ids_no_hit = [seq_ids[batch_idx] for batch_idx in no_hit_indices]
+            x = self._embed(idx_no_hit, start_pos=0)
+            for layer in self.layers:
+                x = layer.forward_prefill(x, block_manager, seq_ids_no_hit)
+            x = self.ln(x.view(len(no_hit_indices) * seq_len, self.n_embd)).view(
+                len(no_hit_indices), seq_len, self.n_embd
+            )
+            logits_no_hit = self.lm_head(
+                x.view(len(no_hit_indices) * seq_len, self.n_embd)
+            ).view(len(no_hit_indices), seq_len, self.n_vocab).to_numpy()
+            logits_np[no_hit_indices] = logits_no_hit
+            for batch_idx in no_hit_indices:
+                block_manager.publish_sequence_prefix_blocks(seq_ids[batch_idx], idx_np[batch_idx])
+
+        hit_groups: Dict[int, List[int]] = {}
+        for batch_idx, match in enumerate(prefix_matches):
+            if match.cached_token_count > 0:
+                hit_groups.setdefault(match.cached_token_count, []).append(batch_idx)
+
+        for cached_token_count, group_indices in hit_groups.items():
+            idx_group = tensor_from_numpy(
+                idx_np[group_indices].astype(np.float32),
+                backend=self.backend,
+            )
+            seq_ids_group = [seq_ids[batch_idx] for batch_idx in group_indices]
+            logits_group = self._forward_prefill_group_with_prefix(
+                idx_group,
+                block_manager,
+                seq_ids_group,
+                cached_token_count,
+            ).to_numpy()
+            logits_np[group_indices] = logits_group
+            for batch_idx in group_indices:
+                block_manager.publish_sequence_prefix_blocks(seq_ids[batch_idx], idx_np[batch_idx])
+
+        return tensor_from_numpy(logits_np, backend=self.backend)
 
     def forward_decode(
         self,

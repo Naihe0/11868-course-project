@@ -535,6 +535,117 @@ class PagedMultiHeadAttention(Module):
             max_context_len=max_context_len,
         )
 
+    def _gather_cached_prefix_kv_batch(
+        self,
+        block_manager: BlockManager,
+        seq_ids: List[int],
+        prefix_token_count: int,
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        key_prefix = np.zeros(
+            (len(seq_ids), prefix_token_count, self.n_head, self.head_dim),
+            dtype=datatype,
+        )
+        value_prefix = np.zeros_like(key_prefix)
+
+        for batch_idx, seq_id in enumerate(seq_ids):
+            for token_idx in range(prefix_token_count):
+                block_id, slot_idx = block_manager.get_physical_location(seq_id, token_idx)
+                key_prefix[batch_idx, token_idx] = block_manager.key_cache[self.layer_id][block_id, slot_idx]
+                value_prefix[batch_idx, token_idx] = block_manager.value_cache[self.layer_id][block_id, slot_idx]
+
+        return key_prefix, value_prefix
+
+    def forward_prefill_with_prefix_batch(
+        self,
+        x: Tensor,
+        block_manager: BlockManager,
+        seq_ids: List[int],
+        prefix_token_count: int,
+        *,
+        write_kv_to_cache: bool = True,
+    ) -> Tensor:
+        """Prefix-aware prefill for a batch that shares one prefix length."""
+        batch_size, work_len, _ = x.shape
+        if batch_size != len(seq_ids):
+            raise ValueError("Batch size must match number of seq_ids")
+        if work_len <= 0:
+            raise ValueError("forward_prefill_with_prefix_batch expects at least one token")
+
+        flat_x = x.contiguous().view(batch_size * work_len, self.n_embd)
+        q = self.q_proj(flat_x).view(batch_size, work_len, self.n_head, self.head_dim)
+        k = self.k_proj(flat_x).view(batch_size, work_len, self.n_head, self.head_dim)
+        v = self.v_proj(flat_x).view(batch_size, work_len, self.n_head, self.head_dim)
+
+        q = q.permute(0, 2, 1, 3)
+        k = k.permute(0, 2, 1, 3)
+        v = v.permute(0, 2, 1, 3)
+
+        k_work = k.permute(0, 2, 1, 3).to_numpy()
+        v_work = v.permute(0, 2, 1, 3).to_numpy()
+
+        if write_kv_to_cache and self.decode_backend == "cuda":
+            self._ensure_kernel_runtime(
+                block_manager,
+                seq_ids,
+                upload_cache_if_needed=True,
+            )
+
+        if write_kv_to_cache:
+            for batch_idx, seq_id in enumerate(seq_ids):
+                for local_idx in range(work_len):
+                    token_index = prefix_token_count + local_idx
+                    block_id, slot_idx = block_manager.get_physical_location(seq_id, token_index)
+                    block_manager.write_kv_slot(
+                        block_id,
+                        slot_idx,
+                        k_work[batch_idx, local_idx],
+                        v_work[batch_idx, local_idx],
+                        layer=self.layer_id,
+                    )
+                    if self.decode_backend == "cuda":
+                        self._kernel.update_slot(
+                            block_id,
+                            slot_idx,
+                            k_work[batch_idx, local_idx],
+                            v_work[batch_idx, local_idx],
+                        )
+
+        prefix_keys, prefix_values = self._gather_cached_prefix_kv_batch(
+            block_manager,
+            seq_ids,
+            prefix_token_count,
+        )
+        full_keys_np = np.concatenate([prefix_keys, k_work], axis=1)
+        full_values_np = np.concatenate([prefix_values, v_work], axis=1)
+        total_context = full_keys_np.shape[1]
+
+        key_tensor = tensor_from_numpy(
+            np.ascontiguousarray(
+                np.transpose(full_keys_np, (0, 2, 1, 3)).astype(datatype)
+            ),
+            backend=x.backend,
+        )
+        value_tensor = tensor_from_numpy(
+            np.ascontiguousarray(
+                np.transpose(full_values_np, (0, 2, 1, 3)).astype(datatype)
+            ),
+            backend=x.backend,
+        )
+
+        mask_np = np.full((work_len, total_context), -1e9, dtype=datatype)
+        for local_idx in range(work_len):
+            mask_np[local_idx, : prefix_token_count + local_idx + 1] = 0.0
+        mask = tensor_from_numpy(
+            mask_np.reshape(1, 1, work_len, total_context),
+            backend=x.backend,
+        )
+
+        output = standard_attention(q, key_tensor, value_tensor, mask)
+        output = output.permute(0, 2, 1, 3).contiguous().view(
+            batch_size * work_len, self.n_embd
+        )
+        return self.out_proj(output).view(batch_size, work_len, self.n_embd)
+
     # ----- Forward (prefill — standard attention) --------------------------
 
     def forward_prefill(

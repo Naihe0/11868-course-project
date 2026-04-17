@@ -132,6 +132,31 @@ class FakePagedAttentionModule:
 
         return to_tensor(x.to_numpy() * self.scale)
 
+    def forward_prefill_with_prefix_batch(
+        self,
+        x,
+        block_manager,
+        seq_ids,
+        prefix_token_count,
+        *,
+        write_kv_to_cache=True,
+    ):
+        x_heads = self._heads(x)
+        batch_size, work_len, _, _ = x_heads.shape
+        if write_kv_to_cache:
+            for batch_idx, seq_id in enumerate(seq_ids):
+                for local_idx in range(work_len):
+                    token_idx = prefix_token_count + local_idx
+                    block_id, slot_idx = block_manager.get_physical_location(seq_id, token_idx)
+                    block_manager.write_kv_slot(
+                        block_id,
+                        slot_idx,
+                        x_heads[batch_idx, local_idx],
+                        x_heads[batch_idx, local_idx],
+                        layer=0,
+                    )
+        return to_tensor(x.to_numpy() * self.scale)
+
     def forward_decode(self, x, block_manager, seq_ids):
         x_heads = self._heads(x)[:, 0]
 
@@ -652,6 +677,286 @@ class TestPagedDecoderLM:
         model.forward_prefill(idx, block_manager, [7])
         with pytest.raises(ValueError):
             model.forward_prefill(idx, block_manager, [7])
+
+    def test_forward_prefill_reuses_published_prefix_blocks(self, rng):
+        from minitorch.transformer import PagedDecoderLM
+        n_vocab = 16
+        n_embd = 6
+        n_head = 2
+        n_positions = 16
+        n_layers = 1
+        block_size = 4
+        prompt_len = 8
+
+        model = PagedDecoderLM(
+            n_vocab=n_vocab,
+            n_embd=n_embd,
+            n_head=n_head,
+            n_positions=n_positions,
+            n_layers=n_layers,
+            block_size=block_size,
+            p_dropout=0.0,
+            backend=_test_backend,
+        )
+        model.token_embeddings = FakeTokenEmbedding(n_embd)
+        model.position_embeddings = FakePositionEmbedding(n_embd)
+        model.layers = [FakePagedAttentionModule(0.0, n_head, n_embd // n_head, block_size)]
+        model.ln = IdentityProjection()
+        model.lm_head = FakeLMHead(n_vocab)
+        block_manager = BlockManager(
+            num_blocks=8,
+            block_size=block_size,
+            n_head=n_head,
+            head_dim=n_embd // n_head,
+            num_layers=n_layers,
+        )
+
+        prompt_np = rng.integers(0, n_vocab, size=(1, prompt_len)).astype(np.float32)
+        prompt = to_tensor(prompt_np)
+
+        model.forward_prefill(prompt, block_manager, [11])
+        first_block_ids = list(block_manager.block_tables[11].block_ids)
+        assert len(first_block_ids) == 2
+
+        block_manager.free_sequence(11)
+        assert set(first_block_ids).issubset(set(block_manager.cached_free_lru.keys()))
+
+        model.forward_prefill(prompt, block_manager, [12])
+        second_block_ids = list(block_manager.block_tables[12].block_ids)
+
+        assert second_block_ids == first_block_ids
+        for block_id in second_block_ids:
+            assert block_manager.blocks[block_id].ref_count == 1
+            assert block_id not in block_manager.cached_free_lru
+
+    def test_forward_prefill_partial_prefix_hit_matches_fresh_prefill(self, rng):
+        from minitorch.transformer import PagedDecoderLM
+        n_vocab = 32
+        n_embd = 16
+        n_head = 4
+        n_positions = 32
+        n_layers = 2
+        block_size = 4
+        prompt_len = 8
+        head_dim = n_embd // n_head
+
+        model = PagedDecoderLM(
+            n_vocab=n_vocab,
+            n_embd=n_embd,
+            n_head=n_head,
+            n_positions=n_positions,
+            n_layers=n_layers,
+            block_size=block_size,
+            p_dropout=0.0,
+            backend=_get_full_model_backend(),
+        )
+        model.eval()
+
+        cached_manager = BlockManager(
+            num_blocks=32,
+            block_size=block_size,
+            n_head=n_head,
+            head_dim=head_dim,
+            num_layers=n_layers,
+        )
+        fresh_manager = BlockManager(
+            num_blocks=32,
+            block_size=block_size,
+            n_head=n_head,
+            head_dim=head_dim,
+            num_layers=n_layers,
+        )
+
+        prompt_a = rng.integers(0, n_vocab, size=(1, prompt_len)).astype(np.float32)
+        prompt_b = prompt_a.copy()
+        prompt_b[0, block_size:] = rng.integers(
+            0, n_vocab, size=(prompt_len - block_size,)
+        ).astype(np.float32)
+
+        logits_a = model.forward_prefill(
+            tensor_from_numpy(prompt_a, backend=_get_full_model_backend()),
+            cached_manager,
+            [10],
+        )
+        assert logits_a.shape == (1, prompt_len, n_vocab)
+        published_block_ids = list(cached_manager.block_tables[10].block_ids)
+        cached_manager.free_sequence(10)
+
+        logits_cached = model.forward_prefill(
+            tensor_from_numpy(prompt_b, backend=_get_full_model_backend()),
+            cached_manager,
+            [11],
+        )
+        logits_fresh = model.forward_prefill(
+            tensor_from_numpy(prompt_b, backend=_get_full_model_backend()),
+            fresh_manager,
+            [21],
+        )
+
+        np.testing.assert_allclose(
+            logits_cached.to_numpy()[:, block_size:, :],
+            logits_fresh.to_numpy()[:, block_size:, :],
+            atol=1e-5,
+            rtol=1e-5,
+        )
+        assert cached_manager.seq_prefix_cache_info[11].cached_token_count == block_size
+        assert cached_manager.block_tables[11].block_ids[0] == published_block_ids[0]
+        assert cached_manager.block_tables[11].block_ids[1] != published_block_ids[1]
+
+    def test_forward_prefill_mixed_batch_prefix_hits_match_fresh_prefill(self, rng):
+        from minitorch.transformer import PagedDecoderLM
+        n_vocab = 32
+        n_embd = 16
+        n_head = 4
+        n_positions = 32
+        n_layers = 2
+        block_size = 4
+        prompt_len = 8
+        head_dim = n_embd // n_head
+
+        model = PagedDecoderLM(
+            n_vocab=n_vocab,
+            n_embd=n_embd,
+            n_head=n_head,
+            n_positions=n_positions,
+            n_layers=n_layers,
+            block_size=block_size,
+            p_dropout=0.0,
+            backend=_get_full_model_backend(),
+        )
+        model.eval()
+
+        cached_manager = BlockManager(
+            num_blocks=32,
+            block_size=block_size,
+            n_head=n_head,
+            head_dim=head_dim,
+            num_layers=n_layers,
+        )
+        fresh_manager = BlockManager(
+            num_blocks=32,
+            block_size=block_size,
+            n_head=n_head,
+            head_dim=head_dim,
+            num_layers=n_layers,
+        )
+
+        reusable_prompt = rng.integers(0, n_vocab, size=(1, prompt_len)).astype(np.float32)
+        model.forward_prefill(
+            tensor_from_numpy(reusable_prompt, backend=_get_full_model_backend()),
+            cached_manager,
+            [30],
+        )
+        reusable_block_ids = list(cached_manager.block_tables[30].block_ids)
+        cached_manager.free_sequence(30)
+
+        fresh_prompt = rng.integers(0, n_vocab, size=(1, prompt_len)).astype(np.float32)
+        batch_prompts = np.concatenate([reusable_prompt, fresh_prompt], axis=0)
+
+        logits_cached = model.forward_prefill(
+            tensor_from_numpy(batch_prompts, backend=_get_full_model_backend()),
+            cached_manager,
+            [31, 32],
+        )
+        logits_fresh = model.forward_prefill(
+            tensor_from_numpy(batch_prompts, backend=_get_full_model_backend()),
+            fresh_manager,
+            [41, 42],
+        )
+
+        np.testing.assert_allclose(
+            logits_cached.to_numpy()[0:1, -1:, :],
+            logits_fresh.to_numpy()[0:1, -1:, :],
+            atol=1e-5,
+            rtol=1e-5,
+        )
+        np.testing.assert_allclose(
+            logits_cached.to_numpy()[1:2],
+            logits_fresh.to_numpy()[1:2],
+            atol=1e-5,
+            rtol=1e-5,
+        )
+        assert cached_manager.seq_prefix_cache_info[31].cached_token_count == prompt_len
+        assert 32 not in cached_manager.seq_prefix_cache_info
+        assert cached_manager.block_tables[31].block_ids == reusable_block_ids
+
+    def test_forward_prefill_groups_same_prefix_hits_in_batch(self, rng):
+        from minitorch.transformer import PagedDecoderLM
+        n_vocab = 32
+        n_embd = 16
+        n_head = 4
+        n_positions = 32
+        n_layers = 2
+        block_size = 4
+        prompt_len = 8
+        head_dim = n_embd // n_head
+
+        model = PagedDecoderLM(
+            n_vocab=n_vocab,
+            n_embd=n_embd,
+            n_head=n_head,
+            n_positions=n_positions,
+            n_layers=n_layers,
+            block_size=block_size,
+            p_dropout=0.0,
+            backend=_get_full_model_backend(),
+        )
+        model.eval()
+
+        cached_manager = BlockManager(
+            num_blocks=32,
+            block_size=block_size,
+            n_head=n_head,
+            head_dim=head_dim,
+            num_layers=n_layers,
+        )
+        fresh_manager = BlockManager(
+            num_blocks=32,
+            block_size=block_size,
+            n_head=n_head,
+            head_dim=head_dim,
+            num_layers=n_layers,
+        )
+
+        published_prompts = rng.integers(0, n_vocab, size=(2, prompt_len)).astype(np.float32)
+        model.forward_prefill(
+            tensor_from_numpy(published_prompts, backend=_get_full_model_backend()),
+            cached_manager,
+            [50, 51],
+        )
+        first_block_ids = {
+            50: list(cached_manager.block_tables[50].block_ids),
+            51: list(cached_manager.block_tables[51].block_ids),
+        }
+        cached_manager.free_sequence(50)
+        cached_manager.free_sequence(51)
+
+        request_prompts = published_prompts.copy()
+        request_prompts[:, block_size:] = rng.integers(
+            0, n_vocab, size=(2, prompt_len - block_size)
+        ).astype(np.float32)
+
+        logits_cached = model.forward_prefill(
+            tensor_from_numpy(request_prompts, backend=_get_full_model_backend()),
+            cached_manager,
+            [52, 53],
+        )
+        logits_fresh = model.forward_prefill(
+            tensor_from_numpy(request_prompts, backend=_get_full_model_backend()),
+            fresh_manager,
+            [62, 63],
+        )
+
+        np.testing.assert_allclose(
+            logits_cached.to_numpy()[:, block_size:, :],
+            logits_fresh.to_numpy()[:, block_size:, :],
+            atol=1e-5,
+            rtol=1e-5,
+        )
+        assert cached_manager.seq_prefix_cache_info[52].cached_token_count == block_size
+        assert cached_manager.seq_prefix_cache_info[53].cached_token_count == block_size
+        assert cached_manager.block_tables[52].block_ids[0] == first_block_ids[50][0]
+        assert cached_manager.block_tables[53].block_ids[0] == first_block_ids[51][0]
 
     def test_generate_output_shape(self, rng):
         """Generate should produce (batch, prompt_len + max_new_tokens) tokens."""
