@@ -108,13 +108,17 @@ __global__ void paged_attention_v1_kernel(
     extern __shared__ float shared_mem[];
     // shared_mem[0 .. context_len-1] = attention logits
     // shared_mem[context_len .. context_len + head_dim - 1] = output accumulator
+    // shared_mem[context_len + head_dim .. context_len + 2*head_dim - 1] = cached query
     float* logits = shared_mem;
     float* out_accum = shared_mem + context_len;
+    float* q_shared = out_accum + head_dim;
 
     // Initialize output accumulator to zero.
     for (int d = tid; d < head_dim; d += num_threads) {
         out_accum[d] = 0.0f;
+        q_shared[d] = q[d];
     }
+    __syncthreads();
 
     // Compute Q·K for each context token.
     float thread_max = -FLT_MAX;
@@ -134,7 +138,7 @@ __global__ void paged_attention_v1_kernel(
         // Full dot product (each thread does the full dot for its token).
         float dot = 0.0f;
         for (int d = 0; d < head_dim; d++) {
-            dot += q[d] * k[d];
+            dot += q_shared[d] * k[d];
         }
         dot *= scale;
         logits[token_idx] = dot;
@@ -156,7 +160,7 @@ __global__ void paged_attention_v1_kernel(
     // Reuse a small region after out_accum for inter-warp communication.
     // out_accum has head_dim floats; we need num_warps floats for reduce.
     // Place warp reduce scratch after out_accum.
-    float* warp_scratch = shared_mem + context_len + head_dim;
+    float* warp_scratch = shared_mem + context_len + 2 * head_dim;
 
     if (lane_id == 0) {
         warp_scratch[warp_id] = warp_max;
@@ -700,7 +704,7 @@ void paged_attention_runtime_forward(
     int threads = paged_attention_threads(runtime->head_dim);
     dim3 block(threads);
     int num_warps = (threads + WARP_SIZE - 1) / WARP_SIZE;
-    size_t smem_bytes = (max_context_len + runtime->head_dim + num_warps) * sizeof(float);
+    size_t smem_bytes = (max_context_len + 2 * runtime->head_dim + num_warps) * sizeof(float);
     size_t query_bytes = (size_t)batch_size * runtime->n_head * runtime->head_dim * sizeof(float);
 
     CUDA_CHECK(cudaMemcpy(
@@ -841,7 +845,7 @@ void paged_attention_forward(
     // Dynamic shared memory: logits[max_context_len] + out_accum[head_dim]
     //                        + warp_scratch[ceil(threads/WARP_SIZE)]
     int num_warps = (threads + WARP_SIZE - 1) / WARP_SIZE;
-    size_t smem_bytes = (max_context_len + head_dim + num_warps) * sizeof(float);
+    size_t smem_bytes = (max_context_len + 2 * head_dim + num_warps) * sizeof(float);
 
     // --- Compute buffer sizes ---
     int num_blocks_cache = 0;
