@@ -411,6 +411,10 @@ struct PagedAttentionRuntime {
     int* d_context_lens;
     float* d_query;
     float* d_output;
+    float* d_prefill_query;
+    float* d_prefill_suffix_key;
+    float* d_prefill_suffix_value;
+    float* d_prefill_output;
 
     int num_blocks;
     int block_size;
@@ -419,6 +423,7 @@ struct PagedAttentionRuntime {
     int max_batch;
     int max_blocks_per_seq;
     int active_max_blocks_per_seq;
+    int prefill_row_capacity;
 };
 
 static inline int paged_attention_threads(int head_dim) {
@@ -440,6 +445,46 @@ static inline size_t block_table_numel(const PagedAttentionRuntime* runtime) {
     return (size_t)runtime->max_batch * runtime->max_blocks_per_seq;
 }
 
+static inline size_t prefill_row_numel(
+    const PagedAttentionRuntime* runtime,
+    int row_capacity
+) {
+    return (size_t)row_capacity * runtime->n_head * runtime->head_dim;
+}
+
+static void ensure_prefill_scratch_capacity(
+    PagedAttentionRuntime* runtime,
+    int required_rows
+) {
+    if (required_rows <= runtime->prefill_row_capacity) {
+        return;
+    }
+
+    if (runtime->d_prefill_query != nullptr) {
+        CUDA_CHECK(cudaFree(runtime->d_prefill_query));
+        runtime->d_prefill_query = nullptr;
+    }
+    if (runtime->d_prefill_suffix_key != nullptr) {
+        CUDA_CHECK(cudaFree(runtime->d_prefill_suffix_key));
+        runtime->d_prefill_suffix_key = nullptr;
+    }
+    if (runtime->d_prefill_suffix_value != nullptr) {
+        CUDA_CHECK(cudaFree(runtime->d_prefill_suffix_value));
+        runtime->d_prefill_suffix_value = nullptr;
+    }
+    if (runtime->d_prefill_output != nullptr) {
+        CUDA_CHECK(cudaFree(runtime->d_prefill_output));
+        runtime->d_prefill_output = nullptr;
+    }
+
+    size_t row_bytes = prefill_row_numel(runtime, required_rows) * sizeof(float);
+    CUDA_CHECK(cudaMalloc(&runtime->d_prefill_query, row_bytes));
+    CUDA_CHECK(cudaMalloc(&runtime->d_prefill_suffix_key, row_bytes));
+    CUDA_CHECK(cudaMalloc(&runtime->d_prefill_suffix_value, row_bytes));
+    CUDA_CHECK(cudaMalloc(&runtime->d_prefill_output, row_bytes));
+    runtime->prefill_row_capacity = required_rows;
+}
+
 void* paged_attention_runtime_create(
     int num_blocks,
     int block_size,
@@ -457,6 +502,10 @@ void* paged_attention_runtime_create(
     runtime->d_context_lens = nullptr;
     runtime->d_query = nullptr;
     runtime->d_output = nullptr;
+    runtime->d_prefill_query = nullptr;
+    runtime->d_prefill_suffix_key = nullptr;
+    runtime->d_prefill_suffix_value = nullptr;
+    runtime->d_prefill_output = nullptr;
 
     runtime->num_blocks = num_blocks;
     runtime->block_size = block_size;
@@ -465,6 +514,7 @@ void* paged_attention_runtime_create(
     runtime->max_batch = max_batch;
     runtime->max_blocks_per_seq = max_blocks_per_seq;
     runtime->active_max_blocks_per_seq = max_blocks_per_seq;
+    runtime->prefill_row_capacity = 0;
 
     size_t cache_bytes = cache_numel(runtime) * sizeof(float);
     size_t query_bytes = query_numel(runtime) * sizeof(float);
@@ -493,6 +543,10 @@ void paged_attention_runtime_destroy(void* handle) {
     cudaFree(runtime->d_context_lens);
     cudaFree(runtime->d_query);
     cudaFree(runtime->d_output);
+    cudaFree(runtime->d_prefill_query);
+    cudaFree(runtime->d_prefill_suffix_key);
+    cudaFree(runtime->d_prefill_suffix_value);
+    cudaFree(runtime->d_prefill_output);
     delete runtime;
 }
 
@@ -704,15 +758,26 @@ void paged_attention_runtime_prefill_with_prefix_forward(
     const size_t row_elems = (size_t)total_rows * runtime->n_head * runtime->head_dim;
     const size_t row_bytes = row_elems * sizeof(float);
 
-    float *d_query = nullptr, *d_suffix_key = nullptr, *d_suffix_value = nullptr, *d_output = nullptr;
-    CUDA_CHECK(cudaMalloc(&d_query, row_bytes));
-    CUDA_CHECK(cudaMalloc(&d_suffix_key, row_bytes));
-    CUDA_CHECK(cudaMalloc(&d_suffix_value, row_bytes));
-    CUDA_CHECK(cudaMalloc(&d_output, row_bytes));
+    ensure_prefill_scratch_capacity(runtime, total_rows);
 
-    CUDA_CHECK(cudaMemcpy(d_query, query_host, row_bytes, cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(d_suffix_key, suffix_key_host, row_bytes, cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(d_suffix_value, suffix_value_host, row_bytes, cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(
+        runtime->d_prefill_query,
+        query_host,
+        row_bytes,
+        cudaMemcpyHostToDevice
+    ));
+    CUDA_CHECK(cudaMemcpy(
+        runtime->d_prefill_suffix_key,
+        suffix_key_host,
+        row_bytes,
+        cudaMemcpyHostToDevice
+    ));
+    CUDA_CHECK(cudaMemcpy(
+        runtime->d_prefill_suffix_value,
+        suffix_value_host,
+        row_bytes,
+        cudaMemcpyHostToDevice
+    ));
 
     float scale = 1.0f / sqrtf((float)runtime->head_dim);
     dim3 grid(total_rows, runtime->n_head);
@@ -722,10 +787,10 @@ void paged_attention_runtime_prefill_with_prefix_forward(
     size_t smem_bytes = (prefix_token_count + work_len + runtime->head_dim + num_warps) * sizeof(float);
 
     paged_attention_prefill_with_prefix_kernel<<<grid, block, smem_bytes>>>(
-        d_output,
-        d_query,
-        d_suffix_key,
-        d_suffix_value,
+        runtime->d_prefill_output,
+        runtime->d_prefill_query,
+        runtime->d_prefill_suffix_key,
+        runtime->d_prefill_suffix_value,
         runtime->d_key_cache,
         runtime->d_value_cache,
         runtime->d_block_tables,
@@ -740,12 +805,12 @@ void paged_attention_runtime_prefill_with_prefix_forward(
     CUDA_CHECK(cudaGetLastError());
     CUDA_CHECK(cudaDeviceSynchronize());
 
-    CUDA_CHECK(cudaMemcpy(output_host, d_output, row_bytes, cudaMemcpyDeviceToHost));
-
-    cudaFree(d_query);
-    cudaFree(d_suffix_key);
-    cudaFree(d_suffix_value);
-    cudaFree(d_output);
+    CUDA_CHECK(cudaMemcpy(
+        output_host,
+        runtime->d_prefill_output,
+        row_bytes,
+        cudaMemcpyDeviceToHost
+    ));
 }
 
 void paged_attention_forward(

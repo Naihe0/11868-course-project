@@ -629,9 +629,15 @@ class PagedMultiHeadAttention(Module):
         context_lens = np.full((batch_size,), prefix_token_count + work_len, dtype=np.int32)
         self._kernel.update_metadata(block_tables, context_lens)
 
-        query_rows = np.transpose(q_np, (0, 2, 1, 3)).reshape(batch_size * work_len, n_head, head_dim)
-        suffix_key_rows = suffix_keys_np.reshape(batch_size * work_len, n_head, head_dim)
-        suffix_value_rows = suffix_values_np.reshape(batch_size * work_len, n_head, head_dim)
+        query_rows = np.ascontiguousarray(
+            np.transpose(q_np, (0, 2, 1, 3)).reshape(batch_size * work_len, n_head, head_dim)
+        )
+        suffix_key_rows = np.ascontiguousarray(
+            suffix_keys_np.reshape(batch_size * work_len, n_head, head_dim)
+        )
+        suffix_value_rows = np.ascontiguousarray(
+            suffix_values_np.reshape(batch_size * work_len, n_head, head_dim)
+        )
         output_rows = np.zeros_like(query_rows)
 
         lib = self._kernel._load_library()
@@ -647,8 +653,10 @@ class PagedMultiHeadAttention(Module):
         )
 
         output_np = output_rows.reshape(batch_size, work_len, n_head, head_dim)
-        output_np = np.transpose(output_np, (0, 2, 1, 3))
-        return tensor_from_numpy(output_np.astype(datatype), backend=q.backend)
+        output_np = np.ascontiguousarray(
+            np.transpose(output_np, (0, 2, 1, 3)).astype(datatype)
+        )
+        return tensor_from_numpy(output_np, backend=q.backend)
 
     def _write_kv_batch_to_cache(
         self,
