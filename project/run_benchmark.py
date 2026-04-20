@@ -68,6 +68,13 @@ def parse_args():
     parser.add_argument("--compare-baseline", action="store_true",
                         help="Also benchmark the non-paged DecoderLM (hw3/hw4) "
                              "for throughput comparison")
+    parser.add_argument("--frag-seq-lengths", type=int, nargs="+",
+                        default=[33, 65, 100, 130],
+                        help="Sequence lengths used for the dedicated "
+                             "fragmentation sweep (chosen to NOT divide "
+                             "evenly into the block sizes).")
+    parser.add_argument("--skip-frag-sweep", action="store_true",
+                        help="Skip the dedicated non-aligned fragmentation sweep")
     parser.add_argument("--compare-prefix-cache", action="store_true",
                         help="Benchmark second-request prefill when the prompt "
                              "shares a prefix with a previously cached request")
@@ -185,7 +192,7 @@ def benchmark_throughput(
     """Measure generation throughput and latency.
 
     Returns dict with: tokens_per_sec, total_time_s, time_per_token_ms,
-                       prefill_time_s, decode_time_s
+                       prefill_time_s, decode_time_s, decode_p50_ms, decode_p95_ms
     """
     batch_size = prompt.shape[0]
 
@@ -199,8 +206,9 @@ def benchmark_throughput(
     last_logits_np = logits.to_numpy()[:, -1, :]
     next_tokens = np.argmax(last_logits_np, axis=-1)
 
-    # --- Decode timing ---
+    # --- Decode timing (per-step latency captured for percentile stats) ---
     prompt_len = prompt.shape[1]
+    per_step_ms: List[float] = []
     decode_start = time.perf_counter()
     for step in range(1, max_new_tokens):
         token_input = tensor_from_numpy(
@@ -208,11 +216,15 @@ def benchmark_throughput(
             backend=model.backend,
         )
         start_pos = prompt_len + step - 1
+        step_t0 = time.perf_counter()
         logits = model.forward_decode(
             token_input, block_manager, seq_ids, start_pos=start_pos,
         )
         logits_np = logits.to_numpy()[:, 0, :]
         next_tokens = np.argmax(logits_np, axis=-1)
+        step_t1 = time.perf_counter()
+        # Per-token latency (ms / token), normalized over the batch
+        per_step_ms.append((step_t1 - step_t0) * 1000.0 / batch_size)
     decode_end = time.perf_counter()
     decode_time = decode_end - decode_start
 
@@ -226,6 +238,12 @@ def benchmark_throughput(
     for seq_id in seq_ids:
         block_manager.free_sequence(seq_id)
 
+    if per_step_ms:
+        p50 = float(np.percentile(per_step_ms, 50))
+        p95 = float(np.percentile(per_step_ms, 95))
+    else:
+        p50 = p95 = 0.0
+
     metrics = {
         "total_time_s": round(total_time, 4),
         "prefill_time_s": round(prefill_time, 4),
@@ -233,6 +251,8 @@ def benchmark_throughput(
         "tokens_per_sec": round(total_generated / total_time, 2) if total_time > 0 else 0,
         "decode_tokens_per_sec": round(decode_tokens / decode_time, 2) if decode_time > 0 else 0,
         "time_per_token_ms": round((decode_time / decode_tokens) * 1000, 2) if decode_tokens > 0 else 0,
+        "decode_p50_ms": round(p50, 2),
+        "decode_p95_ms": round(p95, 2),
     }
     metrics.update(kv_metrics)
     return metrics
@@ -437,17 +457,27 @@ def benchmark_prefix_cache_prefill(
 
 
 def benchmark_fragmentation(block_manager, batch_size, seq_len,
-                             block_size) -> Dict[str, float]:
-    """Measure internal and external memory fragmentation after allocation.
+                             block_size, contiguous_max_seq_len: Optional[int] = None) -> Dict[str, float]:
+    """Measure internal/external fragmentation and KV memory vs contiguous.
 
     Allocates blocks for `batch_size` sequences of `seq_len` tokens,
-    measures fragmentation, then frees them.
+    measures fragmentation and KV bytes (paged vs naive contiguous),
+    then frees them.
+
+    Args:
+        contiguous_max_seq_len: Max seq length the naive contiguous baseline
+            would reserve per sequence. Defaults to ``seq_len`` (an optimistic
+            baseline that already knows the exact length); pass a larger value
+            (e.g. ``n_positions``) to model the realistic worst case.
     """
     seq_ids = list(range(1000, 1000 + batch_size))
     for seq_id in seq_ids:
         block_manager.allocate_blocks_for_sequence(seq_id, seq_len)
 
     frag = block_manager.compute_fragmentation()
+    if contiguous_max_seq_len is None:
+        contiguous_max_seq_len = seq_len
+    mem = block_manager.compute_kv_memory(max_seq_len=contiguous_max_seq_len)
 
     utilization = 0.0
     used = block_manager.num_used_blocks
@@ -464,6 +494,9 @@ def benchmark_fragmentation(block_manager, batch_size, seq_len,
         "blocks_used": used,
         "blocks_total": total,
         "utilization": round(utilization, 4),
+        "kv_bytes_paged": int(mem["kv_bytes_paged"]),
+        "kv_bytes_contiguous_naive": int(mem["kv_bytes_contiguous_naive"]),
+        "memory_savings_ratio": round(mem["memory_savings_ratio"], 4),
     }
 
 
@@ -733,6 +766,7 @@ def main():
                     )
                     frag = benchmark_fragmentation(
                         bm_frag, batch_size, seq_len, block_size,
+                        contiguous_max_seq_len=args.n_positions,
                     )
 
                     result = {**config, **throughput, **frag}
@@ -826,7 +860,53 @@ def main():
                 print(f"  [block_size={block_size}, seq={seq_len}] "
                       f"Max batch size: {max_bs}")
 
-    # Write CSV
+    # ---------------- Dedicated fragmentation sweep ----------------
+    # Use seq lengths that DO NOT divide evenly by the block sizes so
+    # internal fragmentation is non-zero and visible in the report.
+    frag_results: List[Dict] = []
+    if not args.skip_frag_sweep:
+        print("\n" + "=" * 70)
+        print("FRAGMENTATION SWEEP (non-aligned seq lengths)")
+        print("=" * 70)
+        for block_size in args.block_sizes:
+            for seq_len in args.frag_seq_lengths:
+                for batch_size in args.batch_sizes:
+                    bm = _create_block_manager(
+                        args.num_kv_blocks, block_size,
+                        args.n_head, head_dim,
+                    )
+                    blocks_needed = batch_size * (
+                        (seq_len + block_size - 1) // block_size
+                    )
+                    if blocks_needed > args.num_kv_blocks:
+                        continue
+                    frag_row = benchmark_fragmentation(
+                        bm, batch_size, seq_len, block_size,
+                        contiguous_max_seq_len=args.n_positions,
+                    )
+                    row = {
+                        "block_size": block_size,
+                        "batch_size": batch_size,
+                        "seq_len": seq_len,
+                        "n_positions": args.n_positions,
+                        **frag_row,
+                    }
+                    frag_results.append(row)
+                    print(f"  [bs={block_size}, batch={batch_size}, seq={seq_len}] "
+                          f"int_frag={frag_row['internal_frag']:.4f} "
+                          f"savings_vs_contig={frag_row['memory_savings_ratio']:.4f} "
+                          f"({frag_row['kv_bytes_paged']/1024:.1f}KB paged "
+                          f"vs {frag_row['kv_bytes_contiguous_naive']/1024:.1f}KB contig)")
+
+        if frag_results:
+            frag_file = os.path.join(args.output_dir, "fragmentation_results.csv")
+            with open(frag_file, "w", newline="") as f:
+                writer = csv.DictWriter(f, fieldnames=list(frag_results[0].keys()))
+                writer.writeheader()
+                writer.writerows(frag_results)
+            print(f"\nFragmentation results written to {frag_file}")
+
+    # Write main CSV
     if all_results:
         fieldnames = list(all_results[0].keys())
         with open(results_file, "w", newline="") as f:
@@ -845,8 +925,8 @@ def main():
         has_baseline = any("baseline_tokens_per_sec" in r for r in all_results)
         has_prefix = any("prefix_prefill_speedup" in r for r in all_results)
         header = (f"{'BS':>3} {'Batch':>5} {'SeqLen':>6} "
-                  f"{'tok/s':>8} {'ms/tok':>8} "
-                  f"{'IntFrag':>8} {'Util':>6} {'KVeff':>6}")
+                  f"{'tok/s':>8} {'ms/tok':>8} {'p50':>6} {'p95':>6} "
+                  f"{'IntFrag':>8} {'Util':>6} {'KVeff':>6} {'MemSav':>7}")
         if has_baseline:
             header += (
                 f"  {'BL tok/s':>8} {'BL ms/tok':>9}"
@@ -855,15 +935,18 @@ def main():
         if has_prefix:
             header += f" {'PHit':>5} {'PSpd':>6}"
         print(header)
-        print("-" * (70 if not has_baseline and not has_prefix else 128))
+        print("-" * (len(header) + 4))
         for r in all_results:
             row = (f"{r['block_size']:>3} {r['batch_size']:>5} "
                    f"{r['seq_len']:>6} "
                    f"{r['tokens_per_sec']:>8.1f} "
                    f"{r['time_per_token_ms']:>8.1f} "
+                   f"{r.get('decode_p50_ms', 0):>6.1f} "
+                   f"{r.get('decode_p95_ms', 0):>6.1f} "
                    f"{r['internal_frag']:>8.4f} "
                    f"{r['utilization']:>6.3f} "
-                   f"{r['kv_efficiency']:>6.3f}")
+                   f"{r['kv_efficiency']:>6.3f} "
+                   f"{r.get('memory_savings_ratio', 0):>7.3f}")
             if has_baseline and "baseline_time_per_token_ms" in r:
                 row += (
                     f"  {r['baseline_tokens_per_sec']:>8.1f}"
