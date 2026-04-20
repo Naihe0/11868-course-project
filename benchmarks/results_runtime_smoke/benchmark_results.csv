@@ -1,0 +1,5 @@
+block_size,batch_size,seq_len,max_new_tokens,n_embd,n_head,n_layers,total_time_s,prefill_time_s,decode_time_s,tokens_per_sec,decode_tokens_per_sec,time_per_token_ms,internal_frag,external_frag,blocks_used,blocks_total,utilization,correctness_pass,max_abs_error,mean_abs_error
+8,1,8,4,32,4,1,0.1386,0.0329,0.1057,28.86,28.39,35.22,0.0,0.0,1,64,0.0156,1,2.4e-07,2e-08
+8,1,16,4,32,4,1,0.135,0.0337,0.1012,29.64,29.63,33.75,0.0,0.0,2,64,0.0312,1,2.4e-07,2e-08
+8,2,8,4,32,4,1,0.1372,0.0328,0.1044,58.31,57.5,17.39,0.0,0.0,2,64,0.0312,1,2.4e-07,2e-08
+8,2,16,4,32,4,1,0.1445,0.0336,0.1109,55.37,54.11,18.48,0.0,0.0,4,64,0.0625,1,2.4e-07,2e-08

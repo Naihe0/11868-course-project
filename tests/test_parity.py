@@ -109,9 +109,11 @@ def test_paged_prefill_matches_numpy_reference(seq_len, n_head, head_dim):
 
     bm = BlockManager(
         num_blocks=64, block_size=block_size,
-        n_head=n_head, head_dim=head_dim,
+        n_head=n_head, head_dim=head_dim, num_layers=1,
     )
     seq_ids = list(range(batch_size))
+    for seq_id in seq_ids:
+        bm.allocate_blocks_for_sequence(seq_id, seq_len)
     paged_out = paged.forward_prefill(_to_tensor(x_np), bm, seq_ids).to_numpy()
 
     expected = _numpy_mha(x_np, paged, causal=True)
@@ -146,9 +148,11 @@ def test_paged_decode_matches_full_recompute():
 
     bm = BlockManager(
         num_blocks=64, block_size=block_size,
-        n_head=n_head, head_dim=head_dim,
+        n_head=n_head, head_dim=head_dim, num_layers=1,
     )
+    bm.allocate_blocks_for_sequence(0, prompt_len)
     paged.forward_prefill(_to_tensor(prompt_np), bm, [0])
+    bm.append_token_to_sequence(0)
     decoded = paged.forward_decode(_to_tensor(new_tok_np), bm, [0]).to_numpy()
 
     np.testing.assert_allclose(decoded, expected_last, atol=2e-4, rtol=2e-4)
@@ -164,7 +168,7 @@ def test_kv_memory_savings_vs_contiguous():
 
     bm = BlockManager(
         num_blocks=128, block_size=block_size,
-        n_head=n_head, head_dim=head_dim,
+        n_head=n_head, head_dim=head_dim, num_layers=1,
     )
     # 4 sequences of 64 tokens each; contiguous baseline assumes 1024.
     for seq_id in range(4):
@@ -187,7 +191,7 @@ def test_kv_memory_savings_for_aligned_sequences():
 
     bm = BlockManager(
         num_blocks=32, block_size=block_size,
-        n_head=n_head, head_dim=head_dim,
+        n_head=n_head, head_dim=head_dim, num_layers=1,
     )
     # seq_len=8 fits exactly into 2 blocks of size 4 (no internal frag)
     bm.allocate_blocks_for_sequence(0, 8)

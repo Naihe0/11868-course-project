@@ -18,7 +18,7 @@ from minitorch.block_manager import BlockManager
 class TestBlockManagerPerformance:
     def test_allocation_speed(self):
         """Allocating 1000 blocks should complete quickly."""
-        manager = BlockManager(num_blocks=1000, block_size=16, n_head=8, head_dim=64)
+        manager = BlockManager(num_blocks=1000, block_size=16, n_head=8, head_dim=64, num_layers=1)
         start = time.perf_counter()
         for i in range(100):
             manager.allocate_blocks_for_sequence(seq_id=i, num_tokens=128)
@@ -28,7 +28,7 @@ class TestBlockManagerPerformance:
 
     def test_free_and_reallocate(self):
         """Free-then-reallocate cycle should not degrade performance."""
-        manager = BlockManager(num_blocks=256, block_size=16, n_head=8, head_dim=64)
+        manager = BlockManager(num_blocks=256, block_size=16, n_head=8, head_dim=64, num_layers=1)
         num_sequences = 16
         tokens_per_sequence = 128
         num_cycles = 10

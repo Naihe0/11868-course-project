@@ -73,6 +73,10 @@ class PagedTransformerLayer(Module):
         ln_eps: float = 1e-5,
         bias: bool = True,
         backend: TensorBackend = None,
+        layer_id: int = 0,
+        decode_backend: str = "ref",
+        compare_to_ref: bool = False,
+        compare_tolerance: float = 1e-4,
     ):
         super().__init__()
         self.ln_1 = LayerNorm1d(n_embd, ln_eps, backend)
@@ -80,6 +84,10 @@ class PagedTransformerLayer(Module):
         self.attention = PagedMultiHeadAttention(
             n_embd, n_head, block_size=block_size,
             p_dropout=p_dropout, bias=bias, backend=backend,
+            layer_id=layer_id,
+            decode_backend=decode_backend,
+            compare_to_ref=compare_to_ref,
+            compare_tolerance=compare_tolerance,
         )
         self.ff = FeedForward(
             n_embd, middle_dim=4 * n_embd,
@@ -149,6 +157,9 @@ class PagedDecoderLM(Module):
         ln_eps: float = 1e-5,
         bias: bool = True,
         backend: TensorBackend = None,
+        decode_backend: str = "ref",
+        compare_to_ref: bool = False,
+        compare_tolerance: float = 1e-4,
     ):
         super().__init__()
         self.backend = backend
@@ -161,14 +172,19 @@ class PagedDecoderLM(Module):
         self.position_embeddings = Embedding(n_positions, n_embd, backend)
 
         # Transformer layers
-        self.layers = [
-            PagedTransformerLayer(
+        self.layers = []
+        for layer_id in range(n_layers):
+            layer = PagedTransformerLayer(
                 n_embd, n_head, block_size=block_size,
                 p_dropout=p_dropout, ln_eps=ln_eps,
                 bias=bias, backend=backend,
+                layer_id=layer_id,
+                decode_backend=decode_backend,
+                compare_to_ref=compare_to_ref,
+                compare_tolerance=compare_tolerance,
             )
-            for _ in range(n_layers)
-        ]
+            setattr(self, f"layer_{layer_id}", layer)
+            self.layers.append(layer)
 
         # Output head
         self.dropout = Dropout(p_dropout)
@@ -196,6 +212,73 @@ class PagedDecoderLM(Module):
         pos_emb = self.position_embeddings(pos_ids)
         return self.dropout(tok_emb + pos_emb)
 
+    def _forward_prefill_group_with_prefix(
+        self,
+        idx,
+        block_manager: BlockManager,
+        seq_ids: List[int],
+        cached_token_count: int,
+    ):
+        """Run prefix-aware prefill for a group sharing one prefix length."""
+        batch_size, seq_len = idx.shape
+        if batch_size != len(seq_ids):
+            raise ValueError("Batch size must match seq_ids length")
+        if seq_len <= 0:
+            raise ValueError("Prefill expects at least one prompt token")
+
+        work_start = cached_token_count if cached_token_count < seq_len else seq_len - 1
+        write_kv_to_cache = cached_token_count < seq_len
+        idx_np = idx.to_numpy()
+        idx_work = tensor_from_numpy(
+            idx_np[:, work_start:].astype(np.float32),
+            backend=self.backend,
+        )
+
+        x = self._embed(idx_work, start_pos=work_start)
+        prefix_token_count = work_start
+
+        for layer in self.layers:
+            if hasattr(layer, "attention") and hasattr(layer.attention, "forward_prefill_with_prefix_batch"):
+                batch_size, work_len, n_embd = x.shape
+                norm_x = layer.ln_1(x.view(batch_size * work_len, n_embd)).view(
+                    batch_size, work_len, n_embd
+                )
+                x = x + layer.attention.forward_prefill_with_prefix_batch(
+                    norm_x,
+                    block_manager,
+                    seq_ids,
+                    prefix_token_count,
+                    cached_token_count=cached_token_count,
+                    write_kv_to_cache=write_kv_to_cache,
+                )
+                norm_x = layer.ln_2(x.view(batch_size * work_len, n_embd)).view(
+                    batch_size, work_len, n_embd
+                )
+                x = x + layer.ff(norm_x)
+            elif hasattr(layer, "forward_prefill_with_prefix_batch"):
+                x = layer.forward_prefill_with_prefix_batch(
+                    x,
+                    block_manager,
+                    seq_ids,
+                    prefix_token_count,
+                    cached_token_count=cached_token_count,
+                    write_kv_to_cache=write_kv_to_cache,
+                )
+            else:
+                x = layer.forward_prefill(x, block_manager, seq_ids)
+
+        batch_size, work_len, _ = x.shape
+        x = self.ln(x.view(batch_size * work_len, self.n_embd)).view(
+            batch_size, work_len, self.n_embd
+        )
+        logits_work = self.lm_head(
+            x.view(batch_size * work_len, self.n_embd)
+        ).view(batch_size, work_len, self.n_vocab)
+
+        logits_np = np.zeros((batch_size, seq_len, self.n_vocab), dtype=np.float32)
+        logits_np[:, work_start:, :] = logits_work.to_numpy()
+        return tensor_from_numpy(logits_np, backend=self.backend)
+
     def forward_prefill(
         self,
         idx,
@@ -213,18 +296,92 @@ class PagedDecoderLM(Module):
             Logits (batch, seq_len, n_vocab).
         """
         batch_size, seq_len = idx.shape
-        x = self._embed(idx, start_pos=0)
+        idx_np = idx.to_numpy().astype(np.int32)
 
-        for layer in self.layers:
-            x = layer.forward_prefill(x, block_manager, seq_ids)
+        prefix_matches = []
+        for batch_idx, seq_id in enumerate(seq_ids):
+            if seq_id in block_manager.block_tables:
+                raise ValueError(
+                    f"Sequence {seq_id} is already active; free it before prefill"
+                )
+            seq_tokens = idx_np[batch_idx]
+            match = block_manager.lookup_prefix_blocks(seq_tokens)
+            prefix_matches.append(match)
+            if match.block_ids:
+                block_manager.allocate_sequence_with_prefix(
+                    seq_id,
+                    seq_len,
+                    match.block_ids,
+                )
+            else:
+                block_manager.allocate_blocks_for_sequence(seq_id, seq_len)
 
-        x = self.ln(x.view(batch_size * seq_len, self.n_embd)).view(
-            batch_size, seq_len, self.n_embd
-        )
-        logits = self.lm_head(
-            x.view(batch_size * seq_len, self.n_embd)
-        ).view(batch_size, seq_len, self.n_vocab)
-        return logits
+        if all(match.cached_token_count == 0 for match in prefix_matches):
+            x = self._embed(idx, start_pos=0)
+            for layer in self.layers:
+                x = layer.forward_prefill(x, block_manager, seq_ids)
+
+            for batch_idx, seq_id in enumerate(seq_ids):
+                # Publish only after all layers have finished populating K/V so the
+                # cached prefix is fully materialized across the whole network.
+                block_manager.publish_sequence_prefix_blocks(seq_id, idx_np[batch_idx])
+
+            x = self.ln(x.view(batch_size * seq_len, self.n_embd)).view(
+                batch_size, seq_len, self.n_embd
+            )
+            logits = self.lm_head(
+                x.view(batch_size * seq_len, self.n_embd)
+            ).view(batch_size, seq_len, self.n_vocab)
+            return logits
+
+        logits_np = np.zeros((batch_size, seq_len, self.n_vocab), dtype=np.float32)
+
+        no_hit_indices = [
+            batch_idx
+            for batch_idx, match in enumerate(prefix_matches)
+            if match.cached_token_count == 0
+        ]
+        if no_hit_indices:
+            idx_no_hit = tensor_from_numpy(
+                idx_np[no_hit_indices].astype(np.float32),
+                backend=self.backend,
+            )
+            seq_ids_no_hit = [seq_ids[batch_idx] for batch_idx in no_hit_indices]
+            x = self._embed(idx_no_hit, start_pos=0)
+            for layer in self.layers:
+                x = layer.forward_prefill(x, block_manager, seq_ids_no_hit)
+            x = self.ln(x.view(len(no_hit_indices) * seq_len, self.n_embd)).view(
+                len(no_hit_indices), seq_len, self.n_embd
+            )
+            logits_no_hit = self.lm_head(
+                x.view(len(no_hit_indices) * seq_len, self.n_embd)
+            ).view(len(no_hit_indices), seq_len, self.n_vocab).to_numpy()
+            logits_np[no_hit_indices] = logits_no_hit
+            for batch_idx in no_hit_indices:
+                block_manager.publish_sequence_prefix_blocks(seq_ids[batch_idx], idx_np[batch_idx])
+
+        hit_groups: Dict[int, List[int]] = {}
+        for batch_idx, match in enumerate(prefix_matches):
+            if match.cached_token_count > 0:
+                hit_groups.setdefault(match.cached_token_count, []).append(batch_idx)
+
+        for cached_token_count, group_indices in hit_groups.items():
+            idx_group = tensor_from_numpy(
+                idx_np[group_indices].astype(np.float32),
+                backend=self.backend,
+            )
+            seq_ids_group = [seq_ids[batch_idx] for batch_idx in group_indices]
+            logits_group = self._forward_prefill_group_with_prefix(
+                idx_group,
+                block_manager,
+                seq_ids_group,
+                cached_token_count,
+            ).to_numpy()
+            logits_np[group_indices] = logits_group
+            for batch_idx in group_indices:
+                block_manager.publish_sequence_prefix_blocks(seq_ids[batch_idx], idx_np[batch_idx])
+
+        return tensor_from_numpy(logits_np, backend=self.backend)
 
     def forward_decode(
         self,
@@ -247,7 +404,10 @@ class PagedDecoderLM(Module):
         batch_size, seq_len = idx.shape
         assert seq_len == 1, "Decode processes one token at a time"
         x = self._embed(idx, start_pos=start_pos)
-
+        for seq_id in seq_ids:
+            if seq_id not in block_manager.block_tables:
+                block_manager.allocate_blocks_for_sequence(seq_id, 0)
+            block_manager.append_token_to_sequence(seq_id)
         for layer in self.layers:
             x = layer.forward_decode(x, block_manager, seq_ids)
 
@@ -256,6 +416,13 @@ class PagedDecoderLM(Module):
             batch_size, 1, self.n_vocab
         )
         return logits
+
+    def close_decode_runtime(self) -> None:
+        for layer in self.layers:
+            if hasattr(layer, "attention") and hasattr(layer.attention, "close_decode_runtime"):
+                layer.attention.close_decode_runtime()
+            elif hasattr(layer, "close_decode_runtime"):
+                layer.close_decode_runtime()
 
     @staticmethod
     def generate(
@@ -282,13 +449,9 @@ class PagedDecoderLM(Module):
         model.eval()
         batch_size, prompt_len = idx.shape
         generated = idx.to_numpy().tolist()  # list of lists
-
         # 1. Prefill: process the full prompt
         logits = model.forward_prefill(idx, block_manager, seq_ids)
-        # Take logits at the last prompt position
-        last_logits_np = logits.to_numpy()[:, -1, :]  # (batch, n_vocab)
 
-        # 2. Sample next token from last position logits
         def _sample(logits_np: np.ndarray) -> np.ndarray:
             """Temperature-scaled sampling. Returns (batch,) int array."""
             if temperature <= 0:
@@ -301,29 +464,39 @@ class PagedDecoderLM(Module):
             ])
             return tokens
 
-        next_tokens = _sample(last_logits_np)  # (batch,)
-        for b in range(batch_size):
-            generated[b].append(int(next_tokens[b]))
+        try:
+            if max_new_tokens <= 0:
+                return tensor_from_numpy(
+                    np.array(generated, dtype=datatype),
+                    backend=model.backend,
+                )
 
-        # 3. Decode loop
-        for step in range(1, max_new_tokens):
-            # Build input tensor (batch, 1)
-            token_input = tensor_from_numpy(
-                next_tokens.reshape(batch_size, 1).astype(datatype),
-                backend=model.backend,
-            )
-            start_pos = prompt_len + step - 1
-            logits = model.forward_decode(
-                token_input, block_manager, seq_ids, start_pos=start_pos
-            )
-            logits_np = logits.to_numpy()[:, 0, :]  # (batch, n_vocab)
-            next_tokens = _sample(logits_np)
+            # 2. Sample next token from last prompt position logits
+            last_logits_np = logits.to_numpy()[:, -1, :]  # (batch, n_vocab)
+            next_tokens = _sample(last_logits_np)  # (batch,)
             for b in range(batch_size):
                 generated[b].append(int(next_tokens[b]))
 
-        # 4. Free sequences
-        for seq_id in seq_ids:
-            block_manager.free_sequence(seq_id)
+            # 3. Decode loop
+            for step in range(1, max_new_tokens):
+                # Build input tensor (batch, 1)
+                token_input = tensor_from_numpy(
+                    next_tokens.reshape(batch_size, 1).astype(datatype),
+                    backend=model.backend,
+                )
+                start_pos = prompt_len + step - 1
+                logits = model.forward_decode(
+                    token_input, block_manager, seq_ids, start_pos=start_pos
+                )
+                logits_np = logits.to_numpy()[:, 0, :]  # (batch, n_vocab)
+                next_tokens = _sample(logits_np)
+                for b in range(batch_size):
+                    generated[b].append(int(next_tokens[b]))
+        finally:
+            for seq_id in seq_ids:
+                if seq_id in block_manager.block_tables:
+                    block_manager.free_sequence(seq_id)
+            model.close_decode_runtime()
 
         return tensor_from_numpy(
             np.array(generated, dtype=datatype),

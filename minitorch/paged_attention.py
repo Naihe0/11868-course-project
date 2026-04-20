@@ -76,6 +76,7 @@ def paged_attention_ref(
     block_size: int = DEFAULT_BLOCK_SIZE,
     n_head: int = 8,
     head_dim: int = 64,
+    layer_id: int = 0,
 ) -> Tensor:
     """Reference Python implementation of PagedAttention.
 
@@ -100,6 +101,10 @@ def paged_attention_ref(
     Returns:
         Attention output (batch, n_head, 1, head_dim).
     """
+    if isinstance(key_cache, np.ndarray):
+        key_cache = [key_cache]
+        value_cache = [value_cache]
+
     outputs = []
     query_np = query.to_numpy()
 
@@ -112,8 +117,8 @@ def paged_attention_ref(
             logical_block_idx = token_idx // block_size
             slot_idx = token_idx % block_size
             block_id = block_table[logical_block_idx]
-            gathered_keys.append(key_cache[block_id, slot_idx])
-            gathered_values.append(value_cache[block_id, slot_idx])
+            gathered_keys.append(key_cache[layer_id][block_id, slot_idx])
+            gathered_values.append(value_cache[layer_id][block_id, slot_idx])
 
         key_np = np.stack(gathered_keys, axis=1).reshape(1, n_head, context_len, head_dim)
         value_np = np.stack(gathered_values, axis=1).reshape(1, n_head, context_len, head_dim)
@@ -138,6 +143,8 @@ class PagedAttentionKernel:
     def __init__(self, library_path: str = "minitorch/cuda_kernels/paged_attention.so"):
         self.library_path = library_path
         self._lib = None
+        self._runtime = None
+        self._runtime_config: Optional[Tuple[int, int, int, int, int, int]] = None
 
     @staticmethod
     def _to_numpy(value, dtype):
@@ -178,32 +185,203 @@ class PagedAttentionKernel:
             ctypes.c_int,
         ]
         lib.paged_attention_forward.restype = None
+        lib.paged_attention_runtime_create.argtypes = [
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_int,
+        ]
+        lib.paged_attention_runtime_create.restype = ctypes.c_void_p
+        lib.paged_attention_runtime_destroy.argtypes = [ctypes.c_void_p]
+        lib.paged_attention_runtime_destroy.restype = None
+        lib.paged_attention_runtime_upload_layer_cache.argtypes = [
+            ctypes.c_void_p,
+            np.ctypeslib.ndpointer(dtype=datatype, flags="C_CONTIGUOUS"),
+            np.ctypeslib.ndpointer(dtype=datatype, flags="C_CONTIGUOUS"),
+        ]
+        lib.paged_attention_runtime_upload_layer_cache.restype = None
+        lib.paged_attention_runtime_update_slot.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_int,
+            ctypes.c_int,
+            np.ctypeslib.ndpointer(dtype=datatype, flags="C_CONTIGUOUS"),
+            np.ctypeslib.ndpointer(dtype=datatype, flags="C_CONTIGUOUS"),
+        ]
+        lib.paged_attention_runtime_update_slot.restype = None
+        lib.paged_attention_runtime_upload_block.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_int,
+            np.ctypeslib.ndpointer(dtype=datatype, flags="C_CONTIGUOUS"),
+            np.ctypeslib.ndpointer(dtype=datatype, flags="C_CONTIGUOUS"),
+        ]
+        lib.paged_attention_runtime_upload_block.restype = None
+        lib.paged_attention_runtime_update_metadata.argtypes = [
+            ctypes.c_void_p,
+            np.ctypeslib.ndpointer(dtype=np.int32, flags="C_CONTIGUOUS"),
+            np.ctypeslib.ndpointer(dtype=np.int32, flags="C_CONTIGUOUS"),
+            ctypes.c_int,
+            ctypes.c_int,
+        ]
+        lib.paged_attention_runtime_update_metadata.restype = None
+        lib.paged_attention_runtime_forward.argtypes = [
+            ctypes.c_void_p,
+            np.ctypeslib.ndpointer(dtype=datatype, flags="C_CONTIGUOUS"),
+            np.ctypeslib.ndpointer(dtype=datatype, flags="C_CONTIGUOUS"),
+            ctypes.c_int,
+            ctypes.c_int,
+        ]
+        lib.paged_attention_runtime_forward.restype = None
+        lib.paged_attention_runtime_prefill_with_prefix_forward.argtypes = [
+            ctypes.c_void_p,
+            np.ctypeslib.ndpointer(dtype=datatype, flags="C_CONTIGUOUS"),
+            np.ctypeslib.ndpointer(dtype=datatype, flags="C_CONTIGUOUS"),
+            np.ctypeslib.ndpointer(dtype=datatype, flags="C_CONTIGUOUS"),
+            np.ctypeslib.ndpointer(dtype=datatype, flags="C_CONTIGUOUS"),
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_int,
+        ]
+        lib.paged_attention_runtime_prefill_with_prefix_forward.restype = None
         self._lib = lib
         return self._lib
+
+    def ensure_runtime(
+        self,
+        num_blocks: int,
+        block_size: int,
+        n_head: int,
+        head_dim: int,
+        max_batch: int,
+        max_blocks_per_seq: int,
+    ):
+        lib = self._load_library()
+        config = (
+            int(num_blocks),
+            int(block_size),
+            int(n_head),
+            int(head_dim),
+            int(max_batch),
+            int(max_blocks_per_seq),
+        )
+
+        if self._runtime is not None:
+            existing = self._runtime_config
+            if existing is None:
+                self.close()
+            else:
+                compatible = (
+                    existing[0] == config[0]
+                    and existing[1] == config[1]
+                    and existing[2] == config[2]
+                    and existing[3] == config[3]
+                    and existing[4] >= config[4]
+                    and existing[5] >= config[5]
+                )
+                if not compatible:
+                    self.close()
+
+        if self._runtime is None:
+            self._runtime = lib.paged_attention_runtime_create(*config)
+            self._runtime_config = config
+        return self._runtime
+
+    def upload_layer_cache(self, key_cache, value_cache) -> None:
+        lib = self._load_library()
+        if self._runtime is None:
+            raise ValueError("Runtime not initialized")
+
+        key_cache_np = self._to_numpy(key_cache, datatype)
+        value_cache_np = self._to_numpy(value_cache, datatype)
+        if key_cache_np.shape != value_cache_np.shape:
+            raise ValueError("key_cache and value_cache must have the same shape")
+
+        lib.paged_attention_runtime_upload_layer_cache(
+            self._runtime,
+            key_cache_np,
+            value_cache_np,
+        )
+
+    def update_slot(self, block_id: int, slot_idx: int, key, value) -> None:
+        lib = self._load_library()
+        if self._runtime is None:
+            raise ValueError("Runtime not initialized")
+
+        key_np = self._to_numpy(key, datatype)
+        value_np = self._to_numpy(value, datatype)
+        if key_np.shape != value_np.shape:
+            raise ValueError("key and value must have the same shape")
+
+        lib.paged_attention_runtime_update_slot(
+            self._runtime,
+            int(block_id),
+            int(slot_idx),
+            key_np,
+            value_np,
+        )
+
+    def upload_block(self, block_id: int, key_block, value_block) -> None:
+        lib = self._load_library()
+        if self._runtime is None:
+            raise ValueError("Runtime not initialized")
+
+        key_block_np = self._to_numpy(key_block, datatype)
+        value_block_np = self._to_numpy(value_block, datatype)
+        if key_block_np.shape != value_block_np.shape:
+            raise ValueError("key_block and value_block must have the same shape")
+
+        lib.paged_attention_runtime_upload_block(
+            self._runtime,
+            int(block_id),
+            key_block_np,
+            value_block_np,
+        )
+
+    def update_metadata(self, block_tables, context_lens) -> None:
+        lib = self._load_library()
+        if self._runtime is None:
+            raise ValueError("Runtime not initialized")
+
+        block_tables_np = self._to_numpy(block_tables, np.int32)
+        context_lens_np = self._to_numpy(context_lens, np.int32).reshape(-1)
+        if block_tables_np.ndim != 2:
+            raise ValueError("block_tables must be a rank-2 array")
+        if context_lens_np.shape[0] != block_tables_np.shape[0]:
+            raise ValueError("context_lens must match block_tables batch size")
+
+        batch_size = int(block_tables_np.shape[0])
+        max_blocks_per_seq = int(block_tables_np.shape[1]) if block_tables_np.ndim == 2 else 0
+        lib.paged_attention_runtime_update_metadata(
+            self._runtime,
+            block_tables_np,
+            context_lens_np,
+            batch_size,
+            max_blocks_per_seq,
+        )
+
+    def close(self) -> None:
+        lib = self._load_library()
+        if self._runtime is not None:
+            lib.paged_attention_runtime_destroy(self._runtime)
+            self._runtime = None
+            self._runtime_config = None
 
     def forward(
         self,
         query: Tensor,
-        key_cache: Tensor,
-        value_cache: Tensor,
-        block_tables: Tensor,
-        context_lens: Tensor,
-        block_size: int,
-        max_context_len: int,
+        key_cache: Optional[Tensor] = None,
+        value_cache: Optional[Tensor] = None,
+        block_tables: Optional[Tensor] = None,
+        context_lens: Optional[Tensor] = None,
+        block_size: Optional[int] = None,
+        max_context_len: int = 0,
     ) -> Tensor:
         """Run the PagedAttention CUDA kernel.
 
-        Args:
-            query:           (batch, n_head, head_dim)
-            key_cache:       (num_blocks, block_size, n_head, head_dim)
-            value_cache:     (num_blocks, block_size, n_head, head_dim)
-            block_tables:    (batch, max_blocks_per_seq) int tensor
-            context_lens:    (batch,) int tensor
-            block_size:      Tokens per block.
-            max_context_len: Maximum context length across the batch.
-
-        Returns:
-            Attention output (batch, n_head, head_dim).
+        In stateless mode, callers pass the full host-side cache and metadata.
+        In runtime mode, callers first initialize / update the persistent runtime
+        and then call `forward(query, max_context_len=...)`.
         """
         lib = self._load_library()
 
@@ -216,38 +394,62 @@ class PagedAttentionKernel:
         elif query_np.ndim != 3:
             raise ValueError("Query must have shape (batch, n_head, head_dim) or (batch, n_head, 1, head_dim)")
 
-        key_cache_np = self._to_numpy(key_cache, datatype)
-        value_cache_np = self._to_numpy(value_cache, datatype)
-        block_tables_np = self._to_numpy(block_tables, np.int32)
-        context_lens_np = self._to_numpy(context_lens, np.int32).reshape(-1)
-
         batch_size, n_head, head_dim = query_np.shape
-        if key_cache_np.shape[1] != block_size:
-            raise ValueError("key_cache shape does not match block_size")
-        if value_cache_np.shape != key_cache_np.shape:
-            raise ValueError("value_cache must have the same shape as key_cache")
-        if block_tables_np.shape[0] != batch_size:
-            raise ValueError("block_tables batch dimension must match query batch size")
-        if context_lens_np.shape[0] != batch_size:
-            raise ValueError("context_lens length must match query batch size")
-
-        max_blocks_per_seq = block_tables_np.shape[1] if block_tables_np.ndim == 2 else 0
         output_np = np.zeros((batch_size, n_head, head_dim), dtype=datatype)
 
-        lib.paged_attention_forward(
-            output_np,
-            query_np,
-            key_cache_np,
-            value_cache_np,
-            block_tables_np,
-            context_lens_np,
-            batch_size,
-            n_head,
-            head_dim,
-            block_size,
-            max_blocks_per_seq,
-            max_context_len,
+        use_runtime = (
+            self._runtime is not None
+            and key_cache is None
+            and value_cache is None
+            and block_tables is None
+            and context_lens is None
         )
+
+        if use_runtime:
+            lib.paged_attention_runtime_forward(
+                self._runtime,
+                query_np,
+                output_np,
+                batch_size,
+                int(max_context_len),
+            )
+        else:
+            if key_cache is None or value_cache is None or block_tables is None or context_lens is None:
+                raise ValueError(
+                    "Stateless forward requires key_cache, value_cache, block_tables, and context_lens"
+                )
+            if block_size is None:
+                raise ValueError("Stateless forward requires block_size")
+
+            key_cache_np = self._to_numpy(key_cache, datatype)
+            value_cache_np = self._to_numpy(value_cache, datatype)
+            block_tables_np = self._to_numpy(block_tables, np.int32)
+            context_lens_np = self._to_numpy(context_lens, np.int32).reshape(-1)
+
+            if key_cache_np.shape[1] != block_size:
+                raise ValueError("key_cache shape does not match block_size")
+            if value_cache_np.shape != key_cache_np.shape:
+                raise ValueError("value_cache must have the same shape as key_cache")
+            if block_tables_np.shape[0] != batch_size:
+                raise ValueError("block_tables batch dimension must match query batch size")
+            if context_lens_np.shape[0] != batch_size:
+                raise ValueError("context_lens length must match query batch size")
+
+            max_blocks_per_seq = block_tables_np.shape[1] if block_tables_np.ndim == 2 else 0
+            lib.paged_attention_forward(
+                output_np,
+                query_np,
+                key_cache_np,
+                value_cache_np,
+                block_tables_np,
+                context_lens_np,
+                batch_size,
+                n_head,
+                head_dim,
+                block_size,
+                max_blocks_per_seq,
+                max_context_len,
+            )
 
         if original_query_rank == 4:
             output_np = output_np.reshape(batch_size, n_head, 1, head_dim)
@@ -281,6 +483,10 @@ class PagedMultiHeadAttention(Module):
         p_dropout: float = 0.1,
         bias: bool = True,
         backend: TensorBackend = None,
+        layer_id: int = 0,
+        decode_backend: str = "ref",
+        compare_to_ref: bool = False,
+        compare_tolerance: float = 1e-4,
     ):
         super().__init__()
         self.n_embd = n_embd
@@ -288,14 +494,377 @@ class PagedMultiHeadAttention(Module):
         self.head_dim = n_embd // n_head
         self.block_size = block_size
         self.backend = backend
-
-        # Projections (Q, K, V, Output)
+        self.layer_id = layer_id
+        if decode_backend not in {"ref", "cuda"}:
+            raise ValueError("decode_backend must be 'ref' or 'cuda'")
+        self.decode_backend = decode_backend
+        self.compare_to_ref = compare_to_ref
+        self.compare_tolerance = compare_tolerance
+        self.last_decode_compare: Optional[Dict[str, float]] = None
         # CUDA kernel handle (lazy-loaded)
         self.q_proj = Linear(n_embd, n_embd, bias=bias, backend=backend)
         self.k_proj = Linear(n_embd, n_embd, bias=bias, backend=backend)
         self.v_proj = Linear(n_embd, n_embd, bias=bias, backend=backend)
         self.out_proj = Linear(n_embd, n_embd, bias=bias, backend=backend)
         self._kernel: Optional[PagedAttentionKernel] = None
+        self._runtime_block_manager_id: Optional[int] = None
+        self._runtime_valid_block_ids: set[int] = set()
+
+    def _ensure_kernel_runtime(
+        self,
+        block_manager: BlockManager,
+        seq_ids: List[int],
+        required_runtime_batch_size: Optional[int] = None,
+    ) -> None:
+        if self._kernel is None:
+            self._kernel = PagedAttentionKernel()
+
+        previous_runtime = self._kernel._runtime
+        self._kernel.ensure_runtime(
+            num_blocks=block_manager.num_blocks,
+            block_size=self.block_size,
+            n_head=self.n_head,
+            head_dim=self.head_dim,
+            max_batch=max(required_runtime_batch_size or len(seq_ids), 1),
+            max_blocks_per_seq=block_manager.num_blocks,
+        )
+        if self._kernel._runtime is not previous_runtime:
+            self._runtime_valid_block_ids.clear()
+            self._runtime_block_manager_id = None
+
+    def _sync_runtime_blocks_for_sequences(
+        self,
+        block_manager: BlockManager,
+        seq_ids: List[int],
+        token_counts: List[int],
+    ) -> None:
+        if self.decode_backend != "cuda":
+            return
+        if self._kernel is None:
+            raise ValueError("CUDA runtime must be initialized before syncing slots")
+        if len(seq_ids) != len(token_counts):
+            raise ValueError("token_counts must match seq_ids length")
+
+        touched_block_ids = set()
+        for seq_id, token_count in zip(seq_ids, token_counts):
+            for token_idx in range(max(int(token_count), 0)):
+                block_id, _ = block_manager.get_physical_location(seq_id, token_idx)
+                touched_block_ids.add(block_id)
+
+        self._upload_runtime_blocks(block_manager, list(touched_block_ids))
+
+    def _upload_runtime_blocks(
+        self,
+        block_manager: BlockManager,
+        block_ids: List[int],
+    ) -> None:
+        if self.decode_backend != "cuda":
+            return
+        if self._kernel is None:
+            raise ValueError("CUDA runtime must be initialized before uploading blocks")
+
+        block_ids_to_upload = [
+            block_id
+            for block_id in sorted(set(int(block_id) for block_id in block_ids))
+            if block_id not in self._runtime_valid_block_ids
+        ]
+
+        for block_id in block_ids_to_upload:
+            self._kernel.upload_block(
+                block_id,
+                block_manager.key_cache[self.layer_id][block_id],
+                block_manager.value_cache[self.layer_id][block_id],
+            )
+            self._runtime_valid_block_ids.add(block_id)
+
+    def _ensure_runtime_synced_for_sequences(
+        self,
+        block_manager: BlockManager,
+        seq_ids: List[int],
+        token_counts: List[int],
+        required_runtime_batch_size: Optional[int] = None,
+    ) -> None:
+        if self.decode_backend != "cuda":
+            return
+
+        self._ensure_kernel_runtime(
+            block_manager,
+            seq_ids,
+            required_runtime_batch_size=required_runtime_batch_size,
+        )
+        current_manager_id = id(block_manager)
+        if self._runtime_block_manager_id != current_manager_id:
+            self._runtime_valid_block_ids.clear()
+            self._sync_runtime_blocks_for_sequences(block_manager, seq_ids, token_counts)
+            self._runtime_block_manager_id = current_manager_id
+
+    def _prefill_attention_kernel_with_prefix_batch(
+        self,
+        q: Tensor,
+        suffix_keys: np.ndarray,
+        suffix_values: np.ndarray,
+        block_manager: BlockManager,
+        seq_ids: List[int],
+        prefix_token_count: int,
+    ) -> Tensor:
+        if self.decode_backend != "cuda":
+            raise ValueError("Kernel prefill path requires decode_backend='cuda'")
+
+        q_np = np.ascontiguousarray(q.to_numpy().astype(datatype, copy=False))
+        if q_np.ndim != 4:
+            raise ValueError("Expected q to have shape (batch, n_head, work_len, head_dim)")
+        suffix_keys_np = np.ascontiguousarray(suffix_keys.astype(datatype, copy=False))
+        suffix_values_np = np.ascontiguousarray(suffix_values.astype(datatype, copy=False))
+
+        batch_size, n_head, work_len, head_dim = q_np.shape
+        if batch_size != len(seq_ids):
+            raise ValueError("Batch size must match seq_ids length")
+
+        self._ensure_kernel_runtime(
+            block_manager,
+            seq_ids,
+            required_runtime_batch_size=batch_size,
+        )
+        block_tables = block_manager.get_block_table_array(seq_ids)
+        context_lens = np.full((batch_size,), prefix_token_count + work_len, dtype=np.int32)
+        self._kernel.update_metadata(block_tables, context_lens)
+
+        query_rows = np.ascontiguousarray(
+            np.transpose(q_np, (0, 2, 1, 3)).reshape(batch_size * work_len, n_head, head_dim)
+        )
+        suffix_key_rows = np.ascontiguousarray(
+            suffix_keys_np.reshape(batch_size * work_len, n_head, head_dim)
+        )
+        suffix_value_rows = np.ascontiguousarray(
+            suffix_values_np.reshape(batch_size * work_len, n_head, head_dim)
+        )
+        output_rows = np.zeros_like(query_rows)
+
+        lib = self._kernel._load_library()
+        lib.paged_attention_runtime_prefill_with_prefix_forward(
+            self._kernel._runtime,
+            query_rows,
+            suffix_key_rows,
+            suffix_value_rows,
+            output_rows,
+            batch_size,
+            work_len,
+            prefix_token_count,
+        )
+
+        output_np = output_rows.reshape(batch_size, work_len, n_head, head_dim)
+        output_np = np.ascontiguousarray(
+            np.transpose(output_np, (0, 2, 1, 3)).astype(datatype)
+        )
+        return tensor_from_numpy(output_np, backend=q.backend)
+
+    def _write_kv_batch_to_cache(
+        self,
+        block_manager: BlockManager,
+        seq_ids: List[int],
+        token_start: int,
+        key_values: np.ndarray,
+        value_values: np.ndarray,
+    ) -> None:
+        if key_values.shape != value_values.shape:
+            raise ValueError("key_values and value_values must have matching shapes")
+        if key_values.shape[0] != len(seq_ids):
+            raise ValueError("Batch dimension must match seq_ids length")
+
+        if self.decode_backend == "cuda":
+            self._ensure_kernel_runtime(block_manager, seq_ids)
+            current_manager_id = id(block_manager)
+            if self._runtime_block_manager_id != current_manager_id:
+                self._runtime_valid_block_ids.clear()
+
+        touched_block_ids = set()
+        for batch_idx, seq_id in enumerate(seq_ids):
+            for local_idx in range(key_values.shape[1]):
+                token_index = token_start + local_idx
+                block_id, slot_idx = block_manager.get_physical_location(seq_id, token_index)
+                block_manager.write_kv_slot(
+                    block_id,
+                    slot_idx,
+                    key_values[batch_idx, local_idx],
+                    value_values[batch_idx, local_idx],
+                    layer=self.layer_id,
+                )
+                touched_block_ids.add(block_id)
+
+        if self.decode_backend == "cuda":
+            self._upload_runtime_blocks(block_manager, list(touched_block_ids))
+            self._runtime_block_manager_id = id(block_manager)
+
+    def _decode_attention_ref(
+        self,
+        q: Tensor,
+        block_manager: BlockManager,
+        seq_ids: List[int],
+    ) -> Tensor:
+        block_tables = [
+            block_manager.block_tables[seq_id].block_ids for seq_id in seq_ids
+        ]
+        context_lens = [
+            block_manager.get_context_len(seq_id) for seq_id in seq_ids
+        ]
+        return paged_attention_ref(
+            q,
+            block_manager.key_cache,
+            block_manager.value_cache,
+            block_tables,
+            context_lens,
+            block_size=self.block_size,
+            n_head=self.n_head,
+            head_dim=self.head_dim,
+            layer_id=self.layer_id,
+        )
+
+    def _decode_attention_kernel(
+        self,
+        q: Tensor,
+        block_manager: BlockManager,
+        seq_ids: List[int],
+    ) -> Tensor:
+        context_lens = [
+            block_manager.get_context_len(seq_id) for seq_id in seq_ids
+        ]
+        self._ensure_runtime_synced_for_sequences(
+            block_manager,
+            seq_ids,
+            context_lens,
+        )
+        block_tables = block_manager.get_block_table_array(seq_ids)
+        context_lens_np = np.array(context_lens, dtype=np.int32)
+        max_context_len = int(context_lens_np.max()) if len(context_lens_np) > 0 else 0
+        self._kernel.update_metadata(block_tables, context_lens_np)
+        return self._kernel.forward(
+            q,
+            max_context_len=max_context_len,
+        )
+
+    def _gather_cached_prefix_kv_batch(
+        self,
+        block_manager: BlockManager,
+        seq_ids: List[int],
+        prefix_token_count: int,
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        key_prefix = np.zeros(
+            (len(seq_ids), prefix_token_count, self.n_head, self.head_dim),
+            dtype=datatype,
+        )
+        value_prefix = np.zeros_like(key_prefix)
+
+        for batch_idx, seq_id in enumerate(seq_ids):
+            for token_idx in range(prefix_token_count):
+                block_id, slot_idx = block_manager.get_physical_location(seq_id, token_idx)
+                key_prefix[batch_idx, token_idx] = block_manager.key_cache[self.layer_id][block_id, slot_idx]
+                value_prefix[batch_idx, token_idx] = block_manager.value_cache[self.layer_id][block_id, slot_idx]
+
+        return key_prefix, value_prefix
+
+    def forward_prefill_with_prefix_batch(
+        self,
+        x: Tensor,
+        block_manager: BlockManager,
+        seq_ids: List[int],
+        prefix_token_count: int,
+        *,
+        cached_token_count: Optional[int] = None,
+        write_kv_to_cache: bool = True,
+    ) -> Tensor:
+        """Prefix-aware prefill for a batch that shares one prefix length."""
+        batch_size, work_len, _ = x.shape
+        if batch_size != len(seq_ids):
+            raise ValueError("Batch size must match number of seq_ids")
+        if work_len <= 0:
+            raise ValueError("forward_prefill_with_prefix_batch expects at least one token")
+
+        flat_x = x.contiguous().view(batch_size * work_len, self.n_embd)
+        q = self.q_proj(flat_x).view(batch_size, work_len, self.n_head, self.head_dim)
+        k = self.k_proj(flat_x).view(batch_size, work_len, self.n_head, self.head_dim)
+        v = self.v_proj(flat_x).view(batch_size, work_len, self.n_head, self.head_dim)
+
+        q = q.permute(0, 2, 1, 3)
+        k = k.permute(0, 2, 1, 3)
+        v = v.permute(0, 2, 1, 3)
+
+        k_work = k.permute(0, 2, 1, 3).to_numpy()
+        v_work = v.permute(0, 2, 1, 3).to_numpy()
+
+        runtime_token_counts = [cached_token_count or prefix_token_count] * len(seq_ids)
+        required_runtime_batch_size = batch_size * work_len
+        if self.decode_backend == "cuda" and any(token_count > 0 for token_count in runtime_token_counts):
+            self._ensure_runtime_synced_for_sequences(
+                block_manager,
+                seq_ids,
+                runtime_token_counts,
+                required_runtime_batch_size=required_runtime_batch_size,
+            )
+        elif self.decode_backend == "cuda":
+            self._ensure_kernel_runtime(
+                block_manager,
+                seq_ids,
+                required_runtime_batch_size=required_runtime_batch_size,
+            )
+
+        if write_kv_to_cache:
+            self._write_kv_batch_to_cache(
+                block_manager,
+                seq_ids,
+                prefix_token_count,
+                k_work,
+                v_work,
+            )
+
+        if self.decode_backend == "cuda":
+            output = self._prefill_attention_kernel_with_prefix_batch(
+                q,
+                k_work,
+                v_work,
+                block_manager,
+                seq_ids,
+                prefix_token_count,
+            )
+            output = output.permute(0, 2, 1, 3).contiguous().view(
+                batch_size * work_len, self.n_embd
+            )
+            return self.out_proj(output).view(batch_size, work_len, self.n_embd)
+
+        prefix_keys, prefix_values = self._gather_cached_prefix_kv_batch(
+            block_manager,
+            seq_ids,
+            prefix_token_count,
+        )
+        full_keys_np = np.concatenate([prefix_keys, k_work], axis=1)
+        full_values_np = np.concatenate([prefix_values, v_work], axis=1)
+        total_context = full_keys_np.shape[1]
+
+        key_tensor = tensor_from_numpy(
+            np.ascontiguousarray(
+                np.transpose(full_keys_np, (0, 2, 1, 3)).astype(datatype)
+            ),
+            backend=x.backend,
+        )
+        value_tensor = tensor_from_numpy(
+            np.ascontiguousarray(
+                np.transpose(full_values_np, (0, 2, 1, 3)).astype(datatype)
+            ),
+            backend=x.backend,
+        )
+
+        mask_np = np.full((work_len, total_context), -1e9, dtype=datatype)
+        for local_idx in range(work_len):
+            mask_np[local_idx, : prefix_token_count + local_idx + 1] = 0.0
+        mask = tensor_from_numpy(
+            mask_np.reshape(1, 1, work_len, total_context),
+            backend=x.backend,
+        )
+
+        output = standard_attention(q, key_tensor, value_tensor, mask)
+        output = output.permute(0, 2, 1, 3).contiguous().view(
+            batch_size * work_len, self.n_embd
+        )
+        return self.out_proj(output).view(batch_size, work_len, self.n_embd)
 
     # ----- Forward (prefill — standard attention) --------------------------
 
@@ -342,20 +911,13 @@ class PagedMultiHeadAttention(Module):
         k_cache_values = k.permute(0, 2, 1, 3).to_numpy()
         v_cache_values = v.permute(0, 2, 1, 3).to_numpy()
 
-        for batch_idx, seq_id in enumerate(seq_ids):
-            block_table = block_manager.allocate_blocks_for_sequence(seq_id, seq_len)
-
-            for logical_block_idx, block_id in enumerate(block_table.block_ids):
-                block = block_manager.blocks[block_id]
-                start = logical_block_idx * self.block_size
-                end = start + block.num_filled
-
-                block_manager.key_cache[block_id, : block.num_filled, :, :] = (
-                    k_cache_values[batch_idx, start:end, :, :]
-                )
-                block_manager.value_cache[block_id, : block.num_filled, :, :] = (
-                    v_cache_values[batch_idx, start:end, :, :]
-                )
+        self._write_kv_batch_to_cache(
+            block_manager,
+            seq_ids,
+            0,
+            k_cache_values,
+            v_cache_values,
+        )
 
         return output
 
@@ -393,30 +955,66 @@ class PagedMultiHeadAttention(Module):
         k_new = k.permute(0, 2, 1, 3).to_numpy()[:, 0, :, :]
         v_new = v.permute(0, 2, 1, 3).to_numpy()[:, 0, :, :]
 
+        if self.decode_backend == "cuda":
+            prior_context_lens = [
+                block_manager.get_context_len(seq_id) - 1 for seq_id in seq_ids
+            ]
+            self._ensure_runtime_synced_for_sequences(
+                block_manager,
+                seq_ids,
+                prior_context_lens,
+            )
+
         for batch_idx, seq_id in enumerate(seq_ids):
-            if seq_id not in block_manager.block_tables:
-                block_manager.allocate_blocks_for_sequence(seq_id, 0)
-            block_manager.write_token_kv(seq_id, k_new[batch_idx], v_new[batch_idx])
+            block_table = block_manager.block_tables[seq_id]
+            token_index = block_manager.get_context_len(seq_id) - 1
+            block_id, slot_idx = block_manager.get_physical_location(seq_id, token_index)
+            block_manager.write_kv_slot(
+                block_id,
+                slot_idx,
+                k_new[batch_idx],
+                v_new[batch_idx],
+                layer=self.layer_id,
+            )
+            if self.decode_backend == "cuda":
+                self._kernel.update_slot(
+                    block_id,
+                    slot_idx,
+                    k_new[batch_idx],
+                    v_new[batch_idx],
+                )
+                self._runtime_valid_block_ids.add(block_id)
+                self._runtime_block_manager_id = id(block_manager)
 
-        block_tables = [
-            block_manager.block_tables[seq_id].block_ids for seq_id in seq_ids
-        ]
-        context_lens = [
-            block_manager.get_context_len(seq_id) for seq_id in seq_ids
-        ]
-
-        output = paged_attention_ref(
-            q,
-            block_manager.key_cache,
-            block_manager.value_cache,
-            block_tables,
-            context_lens,
-            block_size=self.block_size,
-            n_head=self.n_head,
-            head_dim=self.head_dim,
-        )
+        if self.decode_backend == "cuda":
+            output = self._decode_attention_kernel(q, block_manager, seq_ids)
+            if self.compare_to_ref:
+                ref_output = self._decode_attention_ref(q, block_manager, seq_ids)
+                output_np = output.to_numpy()
+                ref_np = ref_output.to_numpy()
+                max_abs_error = float(np.max(np.abs(output_np - ref_np)))
+                mean_abs_error = float(np.mean(np.abs(output_np - ref_np)))
+                self.last_decode_compare = {
+                    "max_abs_error": max_abs_error,
+                    "mean_abs_error": mean_abs_error,
+                }
+                if max_abs_error > self.compare_tolerance:
+                    raise AssertionError(
+                        "CUDA paged attention mismatch: "
+                        f"max_abs_error={max_abs_error:.6f} "
+                        f"> tolerance={self.compare_tolerance:.6f}"
+                    )
+        else:
+            self.last_decode_compare = None
+            output = self._decode_attention_ref(q, block_manager, seq_ids)
         output = output.permute(0, 2, 1, 3).contiguous().view(
             batch_size * seq_len, self.n_embd
         )
         output = self.out_proj(output).view(batch_size, seq_len, self.n_embd)
         return output
+
+    def close_decode_runtime(self) -> None:
+        if self._kernel is not None:
+            self._kernel.close()
+        self._runtime_block_manager_id = None
+        self._runtime_valid_block_ids.clear()

@@ -1,0 +1,2 @@
+block_size,batch_size,seq_len,max_new_tokens,n_embd,n_head,n_layers,total_time_s,prefill_time_s,decode_time_s,tokens_per_sec,decode_tokens_per_sec,time_per_token_ms,internal_frag,external_frag,blocks_used,blocks_total,utilization,correctness_pass,max_abs_error,mean_abs_error
+8,1,32,4,64,4,2,0.5464,0.1365,0.4099,7.32,7.32,136.63,0.0,0.0,4,512,0.0078,1,1.2e-07,3e-08
