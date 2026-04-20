@@ -289,10 +289,7 @@ class PagedMultiHeadAttention(Module):
         self.block_size = block_size
         self.backend = backend
 
-        # Projections
-        # TODO: Initialize Q, K, V, Output linear projections
-        #       (reuse modules_basic.Linear)
-
+        # Projections (Q, K, V, Output)
         # CUDA kernel handle (lazy-loaded)
         self.q_proj = Linear(n_embd, n_embd, bias=bias, backend=backend)
         self.k_proj = Linear(n_embd, n_embd, bias=bias, backend=backend)

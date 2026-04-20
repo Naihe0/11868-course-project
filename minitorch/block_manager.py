@@ -250,7 +250,6 @@ class BlockManager:
           3. Call `write_kv_slot`
           4. Return `(block_id, slot_idx)`
         """
-        # TODO: Implement append-and-write helper.
         block = self.append_token_to_sequence(seq_id)
         slot_idx = block.num_filled - 1
         self.write_kv_slot(block.block_id, slot_idx, key, value)
@@ -317,6 +316,46 @@ class BlockManager:
         return {
             "internal": internal_fragmentation,
             "external": external_fragmentation,
+        }
+
+    def compute_kv_memory(self, max_seq_len: Optional[int] = None) -> Dict[str, float]:
+        """Compare paged-allocated KV bytes vs naive contiguous reservation.
+
+        The naive contiguous baseline reserves ``max_seq_len`` tokens of KV
+        cache for every active sequence regardless of its actual length
+        (this is what a system without paging must do to avoid copies as
+        sequences grow).
+
+        Args:
+            max_seq_len: Maximum sequence length the contiguous baseline
+                would reserve per sequence. Defaults to
+                ``num_blocks * block_size`` (i.e. the full pool size).
+
+        Returns:
+            Dict with keys ``kv_bytes_paged``, ``kv_bytes_contiguous_naive``,
+            ``memory_savings_ratio``, ``num_active_sequences``.
+        """
+        bytes_per_token = 2 * self.n_head * self.head_dim * np.dtype(self.cache_dtype).itemsize  # K and V
+        bytes_per_block = self.block_size * bytes_per_token
+
+        used_blocks = self.num_used_blocks
+        kv_bytes_paged = used_blocks * bytes_per_block
+
+        num_seqs = len(self.block_tables)
+        if max_seq_len is None:
+            max_seq_len = self.num_blocks * self.block_size
+        kv_bytes_contig = num_seqs * max_seq_len * bytes_per_token
+
+        if kv_bytes_contig > 0:
+            savings_ratio = 1.0 - (kv_bytes_paged / kv_bytes_contig)
+        else:
+            savings_ratio = 0.0
+
+        return {
+            "kv_bytes_paged": float(kv_bytes_paged),
+            "kv_bytes_contiguous_naive": float(kv_bytes_contig),
+            "memory_savings_ratio": float(savings_ratio),
+            "num_active_sequences": num_seqs,
         }
 
     def __repr__(self) -> str:
