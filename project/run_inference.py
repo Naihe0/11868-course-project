@@ -29,10 +29,10 @@ def parse_args():
     parser.add_argument("--prompt-len", type=int, default=32)
     parser.add_argument("--max-new-tokens", type=int, default=64)
     parser.add_argument("--temperature", type=float, default=1.0)
-    parser.add_argument("--backend", type=str, default="cpu",
-                        choices=["cpu", "cuda"])
-    parser.add_argument("--decode-backend", type=str, default="ref",
-                        choices=["ref", "cuda"])
+    parser.add_argument("--backend", type=str, default="auto",
+                        choices=["auto", "cpu", "cuda"])
+    parser.add_argument("--decode-backend", type=str, default="auto",
+                        choices=["auto", "ref", "cuda"])
     parser.add_argument("--compare-to-ref", action="store_true",
                         help="When using CUDA decode, also run the reference "
                              "paged attention and assert the outputs match.")
@@ -50,6 +50,35 @@ def _sample(logits_np: np.ndarray, temperature: float) -> np.ndarray:
     scaled = scaled - np.max(scaled, axis=-1, keepdims=True)
     probs = np.exp(scaled) / np.sum(np.exp(scaled), axis=-1, keepdims=True)
     return np.array([np.random.choice(len(p), p=p) for p in probs])
+
+
+def _cuda_available() -> bool:
+    try:
+        import numba.cuda
+        return bool(numba.cuda.is_available())
+    except Exception:
+        return False
+
+
+def _resolve_backends(requested_backend: str, requested_decode_backend: str):
+    has_cuda = _cuda_available()
+
+    if requested_backend == "auto":
+        backend = "cuda" if has_cuda else "cpu"
+    else:
+        backend = requested_backend
+
+    if requested_decode_backend == "auto":
+        decode_backend = "cuda" if has_cuda else "ref"
+    else:
+        decode_backend = requested_decode_backend
+
+    if backend == "cuda" and not has_cuda:
+        raise RuntimeError("Requested backend=cuda but no CUDA device is available")
+    if decode_backend == "cuda" and not has_cuda:
+        raise RuntimeError("Requested decode-backend=cuda but no CUDA device is available")
+
+    return backend, decode_backend
 
 
 def _reference_last_logits(model, minitorch, full_tokens_np, num_kv_blocks, block_size,
@@ -78,13 +107,16 @@ def main():
     from minitorch.transformer import PagedDecoderLM
     from minitorch.block_manager import BlockManager
 
+    backend_name, decode_backend = _resolve_backends(args.backend, args.decode_backend)
+
     # Select backend
-    if args.backend == "cuda":
+    if backend_name == "cuda":
         backend = minitorch.TensorBackend(minitorch.CudaKernelOps)
     else:
         backend = minitorch.TensorBackend(minitorch.FastOps)
 
-    print(f"Backend: {args.backend}")
+    print(f"Backend: {backend_name}")
+    print(f"Decode backend: {decode_backend}")
     print(f"Model config: vocab={args.n_vocab}, embd={args.n_embd}, "
           f"head={args.n_head}, layers={args.n_layers}")
     print(f"Block config: block_size={args.block_size}, "
@@ -99,7 +131,7 @@ def main():
         n_layers=args.n_layers,
         block_size=args.block_size,
         backend=backend,
-        decode_backend=args.decode_backend,
+        decode_backend=decode_backend,
         compare_to_ref=args.compare_to_ref,
         compare_tolerance=args.compare_tolerance,
     )

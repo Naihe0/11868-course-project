@@ -6,6 +6,7 @@ Extends the hw3 transformer with two operating modes:
   - Paged mode (decode): autoregressive generation using paged KV cache.
 """
 
+import builtins
 import numpy as np
 from .tensor import tensor, tensor_from_numpy
 from .module import Module, Parameter
@@ -502,3 +503,425 @@ class PagedDecoderLM(Module):
             np.array(generated, dtype=datatype),
             backend=model.backend,
         )
+
+    @staticmethod
+    def generate_parallel_sampling(
+        model: "PagedDecoderLM",
+        idx,
+        max_new_tokens: int,
+        num_outputs: int,
+        block_manager: BlockManager,
+        seq_ids: List[int],
+        temperature: float = 1.0,
+    ):
+        """Generate multiple sampled continuations that share one prompt prefix.
+
+        Current implementation targets batch_size == 1. It prefills the prompt
+        once, forks additional sequences that share the prompt KV blocks, and
+        then decodes all continuations together.
+        """
+        model.eval()
+        batch_size, prompt_len = idx.shape
+        if batch_size != 1 or len(seq_ids) != 1:
+            raise NotImplementedError("Parallel sampling currently supports batch_size == 1")
+        if num_outputs <= 0:
+            raise ValueError("num_outputs must be positive")
+
+        def _sample_many(logits_np: np.ndarray, k: int) -> np.ndarray:
+            if temperature <= 0:
+                top = int(np.argmax(logits_np))
+                return np.full((k,), top, dtype=np.int32)
+            scaled = logits_np / temperature
+            scaled = scaled - np.max(scaled)
+            probs = np.exp(scaled) / np.sum(np.exp(scaled))
+            return np.array([np.random.choice(len(probs), p=probs) for _ in range(k)], dtype=np.int32)
+
+        base_seq_id = seq_ids[0]
+        prompt_tokens = idx.to_numpy().astype(np.int32)[0].tolist()
+        next_seq_id = builtins.max(
+            [base_seq_id]
+            + list(block_manager.block_tables.keys())
+            + list(block_manager.context_lens.keys())
+        ) + 1
+
+        logits = model.forward_prefill(idx, block_manager, [base_seq_id])
+        try:
+            if max_new_tokens <= 0:
+                return tensor_from_numpy(
+                    np.array([prompt_tokens], dtype=datatype),
+                    backend=model.backend,
+                )
+
+            active_seq_ids = [base_seq_id]
+            for _ in range(num_outputs - 1):
+                child_seq_id = next_seq_id
+                next_seq_id += 1
+                block_manager.fork_sequence(base_seq_id, child_seq_id)
+                active_seq_ids.append(child_seq_id)
+
+            generated = [list(prompt_tokens) for _ in range(num_outputs)]
+            first_logits = logits.to_numpy()[0, -1, :]
+            next_tokens = _sample_many(first_logits, num_outputs)
+            for out_idx in range(num_outputs):
+                generated[out_idx].append(int(next_tokens[out_idx]))
+
+            for step in range(1, max_new_tokens):
+                token_input = tensor_from_numpy(
+                    next_tokens.reshape(num_outputs, 1).astype(datatype),
+                    backend=model.backend,
+                )
+                start_pos = prompt_len + step - 1
+                logits = model.forward_decode(
+                    token_input, block_manager, active_seq_ids, start_pos=start_pos
+                )
+                logits_np = logits.to_numpy()[:, 0, :]
+                sampled = []
+                for out_idx in range(num_outputs):
+                    sampled.append(_sample_many(logits_np[out_idx], 1)[0])
+                next_tokens = np.array(sampled, dtype=np.int32)
+                for out_idx in range(num_outputs):
+                    generated[out_idx].append(int(next_tokens[out_idx]))
+        finally:
+            for seq_id in list(block_manager.block_tables.keys()):
+                if seq_id in block_manager.block_tables:
+                    block_manager.free_sequence(seq_id)
+            model.close_decode_runtime()
+
+        return tensor_from_numpy(
+            np.array(generated, dtype=datatype),
+            backend=model.backend,
+        )
+
+    @staticmethod
+    def generate_beam_search(
+        model: "PagedDecoderLM",
+        idx,
+        max_new_tokens: int,
+        beam_width: int,
+        block_manager: BlockManager,
+        seq_ids: List[int],
+        eos_token_id: Optional[int] = None,
+    ):
+        """Beam-search generation loop.
+
+        Current implementation targets the common single-request serving case
+        (`batch_size == 1`) and relies on BlockManager live-forking so multiple
+        beams can share the same KV prefix blocks.
+        """
+        model.eval()
+        batch_size, prompt_len = idx.shape
+        if batch_size != 1 or len(seq_ids) != 1:
+            raise NotImplementedError("Beam search currently supports batch_size == 1")
+        if beam_width <= 0:
+            raise ValueError("beam_width must be positive")
+
+        def _log_softmax(logits_np: np.ndarray) -> np.ndarray:
+            shifted = logits_np - np.max(logits_np, axis=-1, keepdims=True)
+            logsumexp = np.log(np.sum(np.exp(shifted), axis=-1, keepdims=True))
+            return shifted - logsumexp
+
+        base_seq_id = seq_ids[0]
+        prompt_tokens = idx.to_numpy().astype(np.int32)[0].tolist()
+        next_seq_id = builtins.max(
+            [base_seq_id]
+            + list(block_manager.block_tables.keys())
+            + list(block_manager.context_lens.keys())
+        ) + 1
+
+        def _allocate_child_seq_id() -> int:
+            nonlocal next_seq_id
+            while next_seq_id in block_manager.block_tables:
+                next_seq_id += 1
+            child_seq_id = next_seq_id
+            next_seq_id += 1
+            return child_seq_id
+
+        logits = model.forward_prefill(idx, block_manager, [base_seq_id])
+        try:
+            if max_new_tokens <= 0:
+                return tensor_from_numpy(
+                    np.array([prompt_tokens], dtype=datatype),
+                    backend=model.backend,
+                )
+
+            initial_log_probs = _log_softmax(logits.to_numpy()[0, -1:, :])[0]
+            initial_topk = np.argsort(initial_log_probs)[-beam_width:][::-1]
+
+            beams = []
+            for rank, token_id in enumerate(initial_topk):
+                if rank == 0:
+                    seq_id = base_seq_id
+                else:
+                    seq_id = _allocate_child_seq_id()
+                    block_manager.fork_sequence(base_seq_id, seq_id)
+                beams.append(
+                    {
+                        "seq_id": seq_id,
+                        "tokens": prompt_tokens + [int(token_id)],
+                        "score": float(initial_log_probs[token_id]),
+                        "finished": eos_token_id is not None and int(token_id) == eos_token_id,
+                    }
+                )
+
+            for step in range(1, max_new_tokens):
+                active_beams = [beam for beam in beams if not beam["finished"]]
+                finished_beams = [beam for beam in beams if beam["finished"]]
+                if not active_beams:
+                    break
+
+                token_input = tensor_from_numpy(
+                    np.array(
+                        [[beam["tokens"][-1]] for beam in active_beams],
+                        dtype=datatype,
+                    ),
+                    backend=model.backend,
+                )
+                active_seq_ids = [beam["seq_id"] for beam in active_beams]
+                decode_logits = model.forward_decode(
+                    token_input,
+                    block_manager,
+                    active_seq_ids,
+                    start_pos=prompt_len + step - 1,
+                )
+                decode_log_probs = _log_softmax(decode_logits.to_numpy()[:, 0, :])
+
+                candidates = [
+                    {
+                        "seq_id": beam["seq_id"],
+                        "tokens": list(beam["tokens"]),
+                        "score": beam["score"],
+                        "finished": True,
+                        "carry": True,
+                    }
+                    for beam in finished_beams
+                ]
+
+                for beam_idx, beam in enumerate(active_beams):
+                    topk = np.argsort(decode_log_probs[beam_idx])[-beam_width:][::-1]
+                    for token_id in topk:
+                        candidates.append(
+                            {
+                                "parent_seq_id": beam["seq_id"],
+                                "parent_tokens": beam["tokens"],
+                                "token_id": int(token_id),
+                                "score": beam["score"] + float(decode_log_probs[beam_idx, token_id]),
+                                "finished": eos_token_id is not None and int(token_id) == eos_token_id,
+                                "carry": False,
+                            }
+                        )
+
+                ordered = sorted(candidates, key=lambda item: item["score"], reverse=True)[:beam_width]
+                next_beams = []
+                parent_use_count: Dict[int, int] = {}
+                retained_seq_ids = set()
+
+                for candidate in ordered:
+                    if candidate["carry"]:
+                        seq_id = candidate["seq_id"]
+                        tokens = candidate["tokens"]
+                    else:
+                        parent_seq_id = candidate["parent_seq_id"]
+                        use_count = parent_use_count.get(parent_seq_id, 0)
+                        if use_count == 0:
+                            seq_id = parent_seq_id
+                        else:
+                            seq_id = _allocate_child_seq_id()
+                            block_manager.fork_sequence(parent_seq_id, seq_id)
+                        parent_use_count[parent_seq_id] = use_count + 1
+                        tokens = list(candidate["parent_tokens"]) + [candidate["token_id"]]
+
+                    next_beams.append(
+                        {
+                            "seq_id": seq_id,
+                            "tokens": tokens,
+                            "score": candidate["score"],
+                            "finished": candidate["finished"],
+                        }
+                    )
+                    retained_seq_ids.add(seq_id)
+
+                old_seq_ids = {beam["seq_id"] for beam in beams}
+                for seq_id in sorted(old_seq_ids - retained_seq_ids):
+                    if seq_id in block_manager.block_tables:
+                        block_manager.free_sequence(seq_id)
+
+                beams = next_beams
+
+            beams = sorted(beams, key=lambda beam: beam["score"], reverse=True)
+            return tensor_from_numpy(
+                np.array([beam["tokens"] for beam in beams], dtype=datatype),
+                backend=model.backend,
+            )
+        finally:
+            live_seq_ids = sorted({beam["seq_id"] for beam in locals().get("beams", [])})
+            if not live_seq_ids and base_seq_id in block_manager.block_tables:
+                live_seq_ids = [base_seq_id]
+            for seq_id in live_seq_ids:
+                if seq_id in block_manager.block_tables:
+                    block_manager.free_sequence(seq_id)
+            model.close_decode_runtime()
+
+    @staticmethod
+    def generate_beam_search_naive(
+        model: "PagedDecoderLM",
+        idx,
+        max_new_tokens: int,
+        beam_width: int,
+        block_manager: BlockManager,
+        seq_ids: List[int],
+        eos_token_id: Optional[int] = None,
+    ):
+        """Beam search baseline without KV sharing.
+
+        Child beams physically duplicate the parent's current KV cache using
+        `clone_sequence(...)` instead of sharing blocks with `fork_sequence(...)`.
+        """
+        model.eval()
+        batch_size, prompt_len = idx.shape
+        if batch_size != 1 or len(seq_ids) != 1:
+            raise NotImplementedError("Naive beam search currently supports batch_size == 1")
+        if beam_width <= 0:
+            raise ValueError("beam_width must be positive")
+
+        def _log_softmax(logits_np: np.ndarray) -> np.ndarray:
+            shifted = logits_np - np.max(logits_np, axis=-1, keepdims=True)
+            logsumexp = np.log(np.sum(np.exp(shifted), axis=-1, keepdims=True))
+            return shifted - logsumexp
+
+        base_seq_id = seq_ids[0]
+        prompt_tokens = idx.to_numpy().astype(np.int32)[0].tolist()
+        next_seq_id = builtins.max(
+            [base_seq_id]
+            + list(block_manager.block_tables.keys())
+            + list(block_manager.context_lens.keys())
+        ) + 1
+
+        def _allocate_child_seq_id() -> int:
+            nonlocal next_seq_id
+            while next_seq_id in block_manager.block_tables:
+                next_seq_id += 1
+            child_seq_id = next_seq_id
+            next_seq_id += 1
+            return child_seq_id
+
+        logits = model.forward_prefill(idx, block_manager, [base_seq_id])
+        try:
+            if max_new_tokens <= 0:
+                return tensor_from_numpy(
+                    np.array([prompt_tokens], dtype=datatype),
+                    backend=model.backend,
+                )
+
+            initial_log_probs = _log_softmax(logits.to_numpy()[0, -1:, :])[0]
+            initial_topk = np.argsort(initial_log_probs)[-beam_width:][::-1]
+
+            beams = []
+            for rank, token_id in enumerate(initial_topk):
+                if rank == 0:
+                    seq_id = base_seq_id
+                else:
+                    seq_id = _allocate_child_seq_id()
+                    block_manager.clone_sequence(base_seq_id, seq_id)
+                beams.append(
+                    {
+                        "seq_id": seq_id,
+                        "tokens": prompt_tokens + [int(token_id)],
+                        "score": float(initial_log_probs[token_id]),
+                        "finished": eos_token_id is not None and int(token_id) == eos_token_id,
+                    }
+                )
+
+            for step in range(1, max_new_tokens):
+                active_beams = [beam for beam in beams if not beam["finished"]]
+                finished_beams = [beam for beam in beams if beam["finished"]]
+                if not active_beams:
+                    break
+
+                token_input = tensor_from_numpy(
+                    np.array([[beam["tokens"][-1]] for beam in active_beams], dtype=datatype),
+                    backend=model.backend,
+                )
+                active_seq_ids = [beam["seq_id"] for beam in active_beams]
+                decode_logits = model.forward_decode(
+                    token_input,
+                    block_manager,
+                    active_seq_ids,
+                    start_pos=prompt_len + step - 1,
+                )
+                decode_log_probs = _log_softmax(decode_logits.to_numpy()[:, 0, :])
+
+                candidates = [
+                    {
+                        "seq_id": beam["seq_id"],
+                        "tokens": list(beam["tokens"]),
+                        "score": beam["score"],
+                        "finished": True,
+                        "carry": True,
+                    }
+                    for beam in finished_beams
+                ]
+
+                for beam_idx, beam in enumerate(active_beams):
+                    topk = np.argsort(decode_log_probs[beam_idx])[-beam_width:][::-1]
+                    for token_id in topk:
+                        candidates.append(
+                            {
+                                "parent_seq_id": beam["seq_id"],
+                                "parent_tokens": beam["tokens"],
+                                "token_id": int(token_id),
+                                "score": beam["score"] + float(decode_log_probs[beam_idx, token_id]),
+                                "finished": eos_token_id is not None and int(token_id) == eos_token_id,
+                                "carry": False,
+                            }
+                        )
+
+                ordered = sorted(candidates, key=lambda item: item["score"], reverse=True)[:beam_width]
+                next_beams = []
+                parent_use_count: Dict[int, int] = {}
+                retained_seq_ids = set()
+
+                for candidate in ordered:
+                    if candidate["carry"]:
+                        seq_id = candidate["seq_id"]
+                        tokens = candidate["tokens"]
+                    else:
+                        parent_seq_id = candidate["parent_seq_id"]
+                        use_count = parent_use_count.get(parent_seq_id, 0)
+                        if use_count == 0:
+                            seq_id = parent_seq_id
+                        else:
+                            seq_id = _allocate_child_seq_id()
+                            block_manager.clone_sequence(parent_seq_id, seq_id)
+                        parent_use_count[parent_seq_id] = use_count + 1
+                        tokens = list(candidate["parent_tokens"]) + [candidate["token_id"]]
+
+                    next_beams.append(
+                        {
+                            "seq_id": seq_id,
+                            "tokens": tokens,
+                            "score": candidate["score"],
+                            "finished": candidate["finished"],
+                        }
+                    )
+                    retained_seq_ids.add(seq_id)
+
+                old_seq_ids = {beam["seq_id"] for beam in beams}
+                for seq_id in sorted(old_seq_ids - retained_seq_ids):
+                    if seq_id in block_manager.block_tables:
+                        block_manager.free_sequence(seq_id)
+
+                beams = next_beams
+
+            beams = sorted(beams, key=lambda beam: beam["score"], reverse=True)
+            return tensor_from_numpy(
+                np.array([beam["tokens"] for beam in beams], dtype=datatype),
+                backend=model.backend,
+            )
+        finally:
+            live_seq_ids = sorted({beam["seq_id"] for beam in locals().get("beams", [])})
+            if not live_seq_ids and base_seq_id in block_manager.block_tables:
+                live_seq_ids = [base_seq_id]
+            for seq_id in live_seq_ids:
+                if seq_id in block_manager.block_tables:
+                    block_manager.free_sequence(seq_id)
+            model.close_decode_runtime()

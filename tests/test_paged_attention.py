@@ -209,6 +209,31 @@ class FakeLMHead:
         return to_tensor(logits)
 
 
+class BeamSearchLMHead:
+    """Deterministic logits table keyed by the current token id."""
+
+    def __init__(self, n_vocab: int):
+        self.n_vocab = n_vocab
+
+    def __call__(self, x):
+        x_np = x.to_numpy()
+        token_ids = np.rint(x_np[:, 0] * 10.0).astype(np.int32)
+        logits = np.full((x_np.shape[0], self.n_vocab), -10.0, dtype=np.float32)
+        for row, token_id in enumerate(token_ids.tolist()):
+            if token_id == 1:
+                logits[row, 2] = 5.0
+                logits[row, 3] = 4.0
+            elif token_id == 2:
+                logits[row, 4] = 6.0
+                logits[row, 5] = 1.0
+            elif token_id == 3:
+                logits[row, 6] = 5.0
+                logits[row, 4] = 2.0
+            else:
+                logits[row, 0] = 1.0
+        return to_tensor(logits)
+
+
 def merge_heads(x):
     batch, n_head, seq_len, head_dim = x.shape
     return np.transpose(x, (0, 2, 1, 3)).reshape(batch, seq_len, n_head * head_dim)
@@ -1064,6 +1089,55 @@ class TestPagedDecoderLM:
         )
         # Sequence should be freed
         assert 42 not in block_manager.block_tables
+
+    def test_generate_beam_search_returns_top_sequences(self):
+        from minitorch.transformer import PagedDecoderLM
+
+        n_vocab = 8
+        n_embd = 4
+        n_head = 2
+        n_positions = 16
+
+        model = PagedDecoderLM(
+            n_vocab=n_vocab,
+            n_embd=n_embd,
+            n_head=n_head,
+            n_positions=n_positions,
+            n_layers=0,
+            block_size=4,
+            p_dropout=0.0,
+            backend=_test_backend,
+        )
+        model.token_embeddings = FakeTokenEmbedding(n_embd)
+        model.position_embeddings = FakePositionEmbedding(n_embd)
+        model.layers = []
+        model.ln = IdentityProjection()
+        model.lm_head = BeamSearchLMHead(n_vocab)
+
+        block_manager = BlockManager(
+            num_blocks=16,
+            block_size=4,
+            n_head=n_head,
+            head_dim=n_embd // n_head,
+            num_layers=0,
+        )
+        idx = to_tensor(np.array([[0, 1]], dtype=np.float32))
+
+        result = PagedDecoderLM.generate_beam_search(
+            model,
+            idx,
+            max_new_tokens=2,
+            beam_width=2,
+            block_manager=block_manager,
+            seq_ids=[77],
+        )
+
+        np.testing.assert_array_equal(
+            result.to_numpy().astype(np.int32),
+            np.array([[0, 1, 2, 4], [0, 1, 3, 6]], dtype=np.int32),
+        )
+        assert block_manager.block_tables == {}
+        assert block_manager.context_lens == {}
 
     def test_generate_frees_sequences_on_decode_error(self, rng):
         from minitorch.transformer import PagedDecoderLM

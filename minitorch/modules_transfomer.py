@@ -259,6 +259,7 @@ class DecoderLM(Module):
         n_embd: int,
         n_head: int,
         n_positions: int,
+        n_layers: int = 4,
         p_dropout: float=0.1,
         ln_eps: float=1e-5, 
         bias: bool=True,
@@ -281,10 +282,7 @@ class DecoderLM(Module):
         Attributes:
             token_embeddings (Embedding): Token embedding layer
             position_embeddings (Embedding): Position embedding layer
-            t_layer_1 (TransformerLayer): First transformer layer
-            t_layer_2 (TransformerLayer): Second transformer layer
-            t_layer_3 (TransformerLayer): Third transformer layer
-            t_layer_4 (TransformerLayer): Fourth transformer layer
+            t_layers (TransformerLayer): Transformer layers
             dropout (Dropout): Dropout layer before transformer layers
             ln (LayerNorm1d): Final layer normalization
             lm_head (Linear): Language model head for vocabulary projection
@@ -292,13 +290,16 @@ class DecoderLM(Module):
         self.backend = backend
         self.n_embd = n_embd
         self.n_vocab = n_vocab
+        self.n_layers = n_layers
 
         self.token_embeddings = Embedding(n_vocab, n_embd, backend=backend)
         self.position_embeddings = Embedding(n_positions, n_embd, backend=backend)
-        self.t_layer_1 = TransformerLayer(n_embd, n_head, p_dropout, ln_eps, bias, backend)
-        self.t_layer_2 = TransformerLayer(n_embd, n_head, p_dropout, ln_eps, bias, backend)
-        self.t_layer_3 = TransformerLayer(n_embd, n_head, p_dropout, ln_eps, bias, backend)
-        self.t_layer_4 = TransformerLayer(n_embd, n_head, p_dropout, ln_eps, bias, backend)
+        for layer_idx in range(n_layers):
+            setattr(
+                self,
+                f"t_layer_{layer_idx + 1}",
+                TransformerLayer(n_embd, n_head, p_dropout, ln_eps, bias, backend),
+            )
         self.dropout = Dropout(p_dropout)
         self.ln = LayerNorm1d(n_embd, ln_eps, backend)
         self.lm_head = Linear(n_embd, n_vocab, bias=bias, backend=backend)
@@ -325,10 +326,8 @@ class DecoderLM(Module):
         pos = self.position_embeddings(pos_ids)
         x = tok + pos
         x = self.dropout(x)
-        x = self.t_layer_1(x)
-        x = self.t_layer_2(x)
-        x = self.t_layer_3(x)
-        x = self.t_layer_4(x)
+        for layer_idx in range(self.n_layers):
+            x = getattr(self, f"t_layer_{layer_idx + 1}")(x)
         x = self.ln(x.view(batch_size * seq_len, self.n_embd)).view(
             batch_size, seq_len, self.n_embd
         )

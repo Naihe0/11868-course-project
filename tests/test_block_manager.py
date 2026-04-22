@@ -147,6 +147,30 @@ class TestSequenceManagement:
         with pytest.raises(ValueError):
             small_manager.allocate_blocks_for_sequence(seq_id=8, num_tokens=2)
 
+    def test_fork_sequence_shares_blocks_and_tail_append_uses_copy_on_write(self, small_manager):
+        parent_table = small_manager.allocate_blocks_for_sequence(seq_id=1, num_tokens=6)
+        tail_block_id = parent_table.block_ids[-1]
+        tail_key = np.arange(16, dtype=np.float32).reshape(2, 8)
+        tail_value = np.arange(16, 32, dtype=np.float32).reshape(2, 8)
+        small_manager.write_kv_slot(tail_block_id, 0, tail_key, tail_value, layer=0)
+
+        child_table = small_manager.fork_sequence(parent_seq_id=1, child_seq_id=2)
+
+        assert child_table.block_ids == parent_table.block_ids
+        assert small_manager.context_lens[2] == 6
+        assert small_manager.blocks[parent_table.block_ids[0]].ref_count == 2
+        assert small_manager.blocks[tail_block_id].ref_count == 2
+
+        appended_block = small_manager.append_token_to_sequence(2)
+
+        assert parent_table.block_ids == [0, 1]
+        assert child_table.block_ids == [0, 2]
+        assert appended_block.block_id == 2
+        assert appended_block.num_filled == 3
+        assert small_manager.blocks[tail_block_id].ref_count == 1
+        np.testing.assert_allclose(small_manager.key_cache[0][2, 0], tail_key)
+        np.testing.assert_allclose(small_manager.value_cache[0][2, 0], tail_value)
+
 
 # ---------------------------------------------------------------------------
 # Block table
