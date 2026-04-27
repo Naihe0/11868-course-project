@@ -51,6 +51,49 @@ python project/run_benchmark.py \
 
 Outputs are written to `benchmarks/results/` by default.
 
+## GPT-2 Pretrained Benchmark Path
+
+`project/run_gpt2_paged_benchmark.py` is the first real-model benchmark path. It loads a HuggingFace GPT-2-family checkpoint into `PagedDecoderLM`, tokenizes real text prompts, runs MiniTorch prefill/decode through the paged KV cache, and writes latency plus KV-cache accounting to CSV.
+
+Install the optional dependencies first:
+
+```bash
+pip install -r requirements.gpt2.txt
+```
+
+Fast loader and shape-mapping smoke run:
+
+```bash
+python project/run_gpt2_paged_benchmark.py \
+  --model-name sshleifer/tiny-gpt2 \
+  --max-prompts 2 \
+  --max-prompt-tokens 16 \
+  --max-new-tokens 4
+```
+
+Real GPT-2 run on WikiText:
+
+```bash
+python project/run_gpt2_paged_benchmark.py \
+  --model-name gpt2 \
+  --dataset-name wikitext \
+  --dataset-config wikitext-2-raw-v1 \
+  --dataset-split test \
+  --max-prompts 8 \
+  --max-prompt-tokens 64 \
+  --max-new-tokens 16
+```
+
+Output defaults to:
+
+```text
+benchmarks/results_gpt2/gpt2_paged_benchmark.csv
+```
+
+This path is intentionally batch-size-1 for now because the MiniTorch decoder does not yet carry a padding attention mask. It is useful for validating pretrained GPT-2 weight mapping and real tokenized prompt behavior before adding batched scheduling.
+
+Start with `sshleifer/tiny-gpt2` when checking code changes. Full `gpt2` is supported by the weight loader, but CPU runs can be slow because the educational MiniTorch embedding path materializes one-hot vectors and the LM head materializes full-vocabulary logits.
+
 ## General Benchmark Run
 
 ```bash

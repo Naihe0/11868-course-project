@@ -247,6 +247,122 @@ __global__ void paged_attention_v1_kernel(
     }
 }
 
+__global__ void contiguous_attention_v1_kernel(
+    float* __restrict__ output,              // [batch, n_head, head_dim]
+    const float* __restrict__ query,         // [batch, n_head, head_dim]
+    const float* __restrict__ key_cache,     // [batch, max_context_len, n_head, head_dim]
+    const float* __restrict__ value_cache,   // [batch, max_context_len, n_head, head_dim]
+    const int* __restrict__ context_lens,    // [batch]
+    const int max_context_len,
+    const int n_head,
+    const int head_dim,
+    const float scale
+) {
+    const int seq_idx  = blockIdx.x;
+    const int head_idx = blockIdx.y;
+    const int tid      = threadIdx.x;
+    const int num_threads = blockDim.x;
+
+    const int context_len = context_lens[seq_idx];
+    if (context_len == 0) return;
+
+    const float* q = query + (seq_idx * n_head + head_idx) * head_dim;
+
+    extern __shared__ float shared_mem[];
+    float* logits = shared_mem;
+    float* out_accum = shared_mem + context_len;
+    float* q_shared = out_accum + head_dim;
+
+    for (int d = tid; d < head_dim; d += num_threads) {
+        out_accum[d] = 0.0f;
+        q_shared[d] = q[d];
+    }
+    __syncthreads();
+
+    float thread_max = -FLT_MAX;
+    for (int token_idx = tid; token_idx < context_len; token_idx += num_threads) {
+        const float* k = key_cache
+            + ((size_t)seq_idx * max_context_len + token_idx) * (n_head * head_dim)
+            + head_idx * head_dim;
+        float dot = 0.0f;
+        for (int d = 0; d < head_dim; d++) {
+            dot += q_shared[d] * k[d];
+        }
+        dot *= scale;
+        logits[token_idx] = dot;
+        thread_max = fmaxf(thread_max, dot);
+    }
+    __syncthreads();
+
+    float warp_max = warp_reduce_max(thread_max);
+    const int warp_id = tid / WARP_SIZE;
+    const int lane_id = tid % WARP_SIZE;
+    const int num_warps = (num_threads + WARP_SIZE - 1) / WARP_SIZE;
+    float* warp_scratch = shared_mem + context_len + 2 * head_dim;
+
+    if (lane_id == 0) {
+        warp_scratch[warp_id] = warp_max;
+    }
+    __syncthreads();
+
+    float global_max = -FLT_MAX;
+    if (tid < num_warps) {
+        global_max = warp_scratch[tid];
+    }
+    global_max = warp_reduce_max(global_max);
+    if (tid == 0) {
+        warp_scratch[0] = global_max;
+    }
+    __syncthreads();
+    global_max = warp_scratch[0];
+
+    float thread_sum = 0.0f;
+    for (int token_idx = tid; token_idx < context_len; token_idx += num_threads) {
+        float val = expf(logits[token_idx] - global_max);
+        logits[token_idx] = val;
+        thread_sum += val;
+    }
+
+    float warp_sum = warp_reduce_sum(thread_sum);
+    if (lane_id == 0) {
+        warp_scratch[warp_id] = warp_sum;
+    }
+    __syncthreads();
+
+    float global_sum = 0.0f;
+    if (tid < num_warps) {
+        global_sum = warp_scratch[tid];
+    }
+    global_sum = warp_reduce_sum(global_sum);
+    if (tid == 0) {
+        warp_scratch[0] = global_sum;
+    }
+    __syncthreads();
+    global_sum = warp_scratch[0];
+
+    for (int token_idx = tid; token_idx < context_len; token_idx += num_threads) {
+        logits[token_idx] /= global_sum;
+    }
+    __syncthreads();
+
+    for (int d = tid; d < head_dim; d += num_threads) {
+        float acc = 0.0f;
+        for (int token_idx = 0; token_idx < context_len; token_idx++) {
+            const float* v = value_cache
+                + ((size_t)seq_idx * max_context_len + token_idx) * (n_head * head_dim)
+                + head_idx * head_dim;
+            acc += logits[token_idx] * v[d];
+        }
+        out_accum[d] = acc;
+    }
+    __syncthreads();
+
+    float* out = output + (seq_idx * n_head + head_idx) * head_dim;
+    for (int d = tid; d < head_dim; d += num_threads) {
+        out[d] = out_accum[d];
+    }
+}
+
 __global__ void paged_attention_prefill_with_prefix_kernel(
     float* __restrict__ output,               // [batch, work_len, n_head, head_dim]
     const float* __restrict__ query,          // [batch, work_len, n_head, head_dim]
@@ -682,6 +798,31 @@ void paged_attention_runtime_update_metadata(
     ));
 }
 
+void paged_attention_runtime_copy_layer_cache_from_device(
+    void* handle,
+    const float* key_cache_device,
+    const float* value_cache_device
+) {
+    if (handle == nullptr) return;
+    CUDA_CHECK(cudaSetDevice(0));
+
+    PagedAttentionRuntime* runtime = static_cast<PagedAttentionRuntime*>(handle);
+    size_t cache_bytes = cache_numel(runtime) * sizeof(float);
+
+    CUDA_CHECK(cudaMemcpy(
+        runtime->d_key_cache,
+        key_cache_device,
+        cache_bytes,
+        cudaMemcpyDeviceToDevice
+    ));
+    CUDA_CHECK(cudaMemcpy(
+        runtime->d_value_cache,
+        value_cache_device,
+        cache_bytes,
+        cudaMemcpyDeviceToDevice
+    ));
+}
+
 void paged_attention_runtime_forward(
     void* handle,
     const float* query_host,
@@ -738,6 +879,81 @@ void paged_attention_runtime_forward(
     ));
 }
 
+void paged_attention_runtime_forward_device(
+    void* handle,
+    const float* query_device,
+    float* output_device,
+    int batch_size,
+    int max_context_len
+) {
+    if (handle == nullptr) return;
+    CUDA_CHECK(cudaSetDevice(0));
+
+    PagedAttentionRuntime* runtime = static_cast<PagedAttentionRuntime*>(handle);
+    if (batch_size > runtime->max_batch) {
+        fprintf(stderr, "paged_attention_runtime_forward_device: batch_size=%d exceeds max_batch=%d\n",
+                batch_size, runtime->max_batch);
+        return;
+    }
+
+    float scale = 1.0f / sqrtf((float)runtime->head_dim);
+    dim3 grid(batch_size, runtime->n_head);
+    int threads = paged_attention_threads(runtime->head_dim);
+    dim3 block(threads);
+    int num_warps = (threads + WARP_SIZE - 1) / WARP_SIZE;
+    size_t smem_bytes = (max_context_len + 2 * runtime->head_dim + num_warps) * sizeof(float);
+
+    paged_attention_v1_kernel<<<grid, block, smem_bytes>>>(
+        output_device,
+        query_device,
+        runtime->d_key_cache,
+        runtime->d_value_cache,
+        runtime->d_block_tables,
+        runtime->d_context_lens,
+        runtime->block_size,
+        runtime->active_max_blocks_per_seq,
+        runtime->n_head,
+        runtime->head_dim,
+        scale
+    );
+    CUDA_CHECK(cudaGetLastError());
+    CUDA_CHECK(cudaDeviceSynchronize());
+}
+
+void contiguous_attention_forward_device(
+    float* output_device,
+    const float* query_device,
+    const float* key_cache_device,
+    const float* value_cache_device,
+    const int* context_lens_device,
+    int batch_size,
+    int n_head,
+    int head_dim,
+    int max_context_len
+) {
+    CUDA_CHECK(cudaSetDevice(0));
+
+    float scale = 1.0f / sqrtf((float)head_dim);
+    dim3 grid(batch_size, n_head);
+    int threads = paged_attention_threads(head_dim);
+    dim3 block(threads);
+    int num_warps = (threads + WARP_SIZE - 1) / WARP_SIZE;
+    size_t smem_bytes = (max_context_len + 2 * head_dim + num_warps) * sizeof(float);
+
+    contiguous_attention_v1_kernel<<<grid, block, smem_bytes>>>(
+        output_device,
+        query_device,
+        key_cache_device,
+        value_cache_device,
+        context_lens_device,
+        max_context_len,
+        n_head,
+        head_dim,
+        scale
+    );
+    CUDA_CHECK(cudaGetLastError());
+    CUDA_CHECK(cudaDeviceSynchronize());
+}
 void paged_attention_runtime_prefill_with_prefix_forward(
     void* handle,
     const float* query_host,

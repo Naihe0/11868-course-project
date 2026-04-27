@@ -202,6 +202,12 @@ class PagedAttentionKernel:
             np.ctypeslib.ndpointer(dtype=datatype, flags="C_CONTIGUOUS"),
         ]
         lib.paged_attention_runtime_upload_layer_cache.restype = None
+        lib.paged_attention_runtime_copy_layer_cache_from_device.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_void_p,
+            ctypes.c_void_p,
+        ]
+        lib.paged_attention_runtime_copy_layer_cache_from_device.restype = None
         lib.paged_attention_runtime_update_slot.argtypes = [
             ctypes.c_void_p,
             ctypes.c_int,
@@ -233,6 +239,26 @@ class PagedAttentionKernel:
             ctypes.c_int,
         ]
         lib.paged_attention_runtime_forward.restype = None
+        lib.paged_attention_runtime_forward_device.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_void_p,
+            ctypes.c_void_p,
+            ctypes.c_int,
+            ctypes.c_int,
+        ]
+        lib.paged_attention_runtime_forward_device.restype = None
+        lib.contiguous_attention_forward_device.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_void_p,
+            ctypes.c_void_p,
+            ctypes.c_void_p,
+            ctypes.c_void_p,
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_int,
+        ]
+        lib.contiguous_attention_forward_device.restype = None
         lib.paged_attention_runtime_prefill_with_prefix_forward.argtypes = [
             ctypes.c_void_p,
             np.ctypeslib.ndpointer(dtype=datatype, flags="C_CONTIGUOUS"),
@@ -303,6 +329,17 @@ class PagedAttentionKernel:
             value_cache_np,
         )
 
+    def copy_layer_cache_from_device(self, key_cache_ptr: int, value_cache_ptr: int) -> None:
+        lib = self._load_library()
+        if self._runtime is None:
+            raise ValueError("Runtime not initialized")
+
+        lib.paged_attention_runtime_copy_layer_cache_from_device(
+            self._runtime,
+            ctypes.c_void_p(int(key_cache_ptr)),
+            ctypes.c_void_p(int(value_cache_ptr)),
+        )
+
     def update_slot(self, block_id: int, slot_idx: int, key, value) -> None:
         lib = self._load_library()
         if self._runtime is None:
@@ -358,6 +395,50 @@ class PagedAttentionKernel:
             context_lens_np,
             batch_size,
             max_blocks_per_seq,
+        )
+
+    def forward_device(
+        self,
+        query_ptr: int,
+        output_ptr: int,
+        batch_size: int,
+        max_context_len: int,
+    ) -> None:
+        lib = self._load_library()
+        if self._runtime is None:
+            raise ValueError("Runtime not initialized")
+
+        lib.paged_attention_runtime_forward_device(
+            self._runtime,
+            ctypes.c_void_p(int(query_ptr)),
+            ctypes.c_void_p(int(output_ptr)),
+            int(batch_size),
+            int(max_context_len),
+        )
+
+    def contiguous_forward_device(
+        self,
+        output_ptr: int,
+        query_ptr: int,
+        key_cache_ptr: int,
+        value_cache_ptr: int,
+        context_lens_ptr: int,
+        batch_size: int,
+        n_head: int,
+        head_dim: int,
+        max_context_len: int,
+    ) -> None:
+        lib = self._load_library()
+        lib.contiguous_attention_forward_device(
+            ctypes.c_void_p(int(output_ptr)),
+            ctypes.c_void_p(int(query_ptr)),
+            ctypes.c_void_p(int(key_cache_ptr)),
+            ctypes.c_void_p(int(value_cache_ptr)),
+            ctypes.c_void_p(int(context_lens_ptr)),
+            int(batch_size),
+            int(n_head),
+            int(head_dim),
+            int(max_context_len),
         )
 
     def close(self) -> None:
