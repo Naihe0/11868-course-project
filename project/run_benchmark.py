@@ -874,6 +874,7 @@ def main():
                     bm = _create_block_manager(
                         args.num_kv_blocks, block_size,
                         args.n_head, head_dim,
+                        args.n_layers,
                     )
                     blocks_needed = batch_size * (
                         (seq_len + block_size - 1) // block_size
