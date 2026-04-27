@@ -55,8 +55,10 @@ Historical project material remains in [docs/design.md](docs/design.md), [docs/R
 │   ├── run_inference.py
 │   ├── run_benchmark.py
 │   ├── run_rigorous_benchmark.py
+│   ├── run_gpt2_paged_benchmark.py
 │   ├── contiguous_kv_baseline.py
 │   ├── plot.py
+│   ├── plot_gpt2_benchmark.py
 │   └── plot_rigorous_figures.py
 ├── tests/
 │   ├── test_block_manager.py
@@ -147,6 +149,21 @@ Plot general benchmark results:
 
 ```bash
 python project/plot.py
+```
+
+GPT-2 real-data MiniTorch GPU KV benchmark:
+
+```bash
+python project/run_gpt2_paged_benchmark.py \
+  --model-name gpt2 \
+  --dataset-name wikitext \
+  --dataset-config wikitext-2-raw-v1 \
+  --dataset-split test \
+  --batch-sizes 1 \
+  --seq-lengths 1 \
+  --warmup-iters 0 \
+  --timed-iters 1
+python project/plot_gpt2_benchmark.py
 ```
 
 Rigorous report/poster benchmark:

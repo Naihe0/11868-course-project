@@ -1,33 +1,16 @@
-"""
-Benchmark a HuggingFace GPT-2-family checkpoint through MiniTorch PagedAttention.
+"""Benchmark pretrained GPT-2 with MiniTorch GPU-resident KV caches.
 
-This is the first "real model" path for the project: it loads pretrained GPT-2
-weights into the existing PagedDecoderLM architecture, tokenizes natural-language
-prompts, runs prefill/decode with the BlockManager-backed KV cache, and writes a
-CSV with latency and KV-cache accounting.
+This script uses Hugging Face only to load pretrained weights, tokenize a real
+dataset, and hand the weights to the local MiniTorch model.  The timed baseline,
+contiguous-KV, and paged-attention paths run the full MiniTorch model.  The
+paged and contiguous KV caches are device-owned and updated with device-to-device
+copies; no timed KV cache path stages K/V through CPU memory.
 
-Install optional dependencies first:
-
-    pip install -r requirements.gpt2.txt
-
-Example smoke run:
+Smoke run:
 
     python project/run_gpt2_paged_benchmark.py \
-        --model-name sshleifer/tiny-gpt2 \
-        --max-prompts 2 \
-        --max-prompt-tokens 16 \
-        --max-new-tokens 4
-
-Example GPT-2 run on WikiText:
-
-    python project/run_gpt2_paged_benchmark.py \
-        --model-name gpt2 \
-        --dataset-name wikitext \
-        --dataset-config wikitext-2-raw-v1 \
-        --dataset-split test \
-        --max-prompts 8 \
-        --max-prompt-tokens 64 \
-        --max-new-tokens 16
+        --model-name gpt2 --batch-sizes 1 --seq-lengths 8 \
+        --warmup-iters 1 --timed-iters 3
 """
 
 from __future__ import annotations
@@ -35,502 +18,640 @@ from __future__ import annotations
 import argparse
 import csv
 import math
-import os
 import sys
 import time
-from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable, List, Optional, Sequence, Tuple
+from typing import Dict, Iterable, List, Sequence
 
+import numba
 import numpy as np
+from numba import cuda
 
 sys.path.insert(0, ".")
 
 import minitorch
-from minitorch.block_manager import BlockManager, CACHE_DTYPE, DEFAULT_BLOCK_SIZE
-from minitorch.tensor import tensor_from_numpy
+from minitorch.block_manager import BlockManager
+from minitorch.module import Parameter
+from minitorch.paged_attention import PagedAttentionKernel, standard_attention
+from minitorch.tensor import Tensor, tensor_from_numpy
 from minitorch.transformer import PagedDecoderLM
 
-datatype = np.float32
 
-
-BUILTIN_PROMPTS = [
-    "PagedAttention reduces memory waste by storing key and value tensors in fixed-size blocks.",
-    "In a language model serving system, many requests decode one token at a time after prefill.",
-    "The project compares contiguous KV cache allocation with a block table based paged cache.",
-]
-
-
-@dataclass
-class LoadedGPT2:
-    model: PagedDecoderLM
-    tokenizer: object
-    n_vocab: int
-    n_embd: int
-    n_head: int
-    n_layers: int
-    n_positions: int
-
-    @property
-    def head_dim(self) -> int:
-        return self.n_embd // self.n_head
+DTYPE = np.float32
+DTYPE_SIZE = np.dtype(DTYPE).itemsize
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Run MiniTorch PagedAttention inference with GPT-2 weights."
+        description="Run full-model GPT-2 decode benchmarks on MiniTorch."
     )
     parser.add_argument("--model-name", type=str, default="gpt2")
     parser.add_argument("--revision", type=str, default=None)
     parser.add_argument("--local-files-only", action="store_true")
-    parser.add_argument("--backend", choices=["cpu", "cuda"], default="cpu")
-    parser.add_argument("--decode-backend", choices=["ref", "cuda"], default="ref")
-    parser.add_argument("--block-size", type=int, default=DEFAULT_BLOCK_SIZE)
-    parser.add_argument(
-        "--num-kv-blocks",
-        type=int,
-        default=0,
-        help="Physical KV blocks. Use 0 to allocate just enough blocks per prompt.",
-    )
-    parser.add_argument("--max-prompts", type=int, default=4)
-    parser.add_argument("--min-prompt-tokens", type=int, default=4)
-    parser.add_argument("--max-prompt-tokens", type=int, default=64)
-    parser.add_argument("--max-new-tokens", type=int, default=16)
-    parser.add_argument(
-        "--temperature",
-        type=float,
-        default=0.0,
-        help="0 uses greedy argmax; values >0 sample from softmax.",
-    )
-    parser.add_argument("--seed", type=int, default=0)
-    parser.add_argument("--prompts-file", type=str, default=None)
-    parser.add_argument("--dataset-name", type=str, default=None)
-    parser.add_argument("--dataset-config", type=str, default=None)
+    parser.add_argument("--dataset-name", type=str, default="wikitext")
+    parser.add_argument("--dataset-config", type=str, default="wikitext-2-raw-v1")
     parser.add_argument("--dataset-split", type=str, default="test")
     parser.add_argument("--text-column", type=str, default="text")
-    parser.add_argument(
-        "--contiguous-context-tokens",
-        type=int,
-        default=0,
-        help="Context length for contiguous KV memory estimate. 0 uses model n_positions.",
-    )
+    parser.add_argument("--prompts-file", type=str, default=None)
+    parser.add_argument("--max-dataset-rows", type=int, default=2000)
+    parser.add_argument("--batch-sizes", type=int, nargs="+", default=[1])
+    parser.add_argument("--seq-lengths", type=int, nargs="+", default=[8, 16])
+    parser.add_argument("--block-size", type=int, default=16)
+    parser.add_argument("--static-context-len", type=int, default=0)
+    parser.add_argument("--warmup-iters", type=int, default=1)
+    parser.add_argument("--timed-iters", type=int, default=3)
+    parser.add_argument("--seed", type=int, default=20260427)
     parser.add_argument("--output-dir", type=str, default="benchmarks/results_gpt2")
-    parser.add_argument("--output-csv", type=str, default="gpt2_paged_benchmark.csv")
-    parser.add_argument("--print-generations", action="store_true")
+    parser.add_argument("--output-csv", type=str, default="gpt2_gpu_kv_benchmark.csv")
     return parser.parse_args()
 
 
-def _import_hf_dependencies():
+def _import_hf():
     try:
         import torch
+        from datasets import load_dataset
         from transformers import AutoModelForCausalLM, AutoTokenizer
     except ImportError as exc:
         raise SystemExit(
-            "Missing GPT-2 benchmark dependencies. Install them with: "
-            "pip install -r requirements.gpt2.txt"
+            "Missing GPT-2 benchmark dependencies. Install `requirements.gpt2.txt`."
         ) from exc
-    return torch, AutoModelForCausalLM, AutoTokenizer
+    return torch, load_dataset, AutoModelForCausalLM, AutoTokenizer
 
 
-def _create_backend(backend_name: str):
-    if backend_name == "cuda":
-        return minitorch.TensorBackend(minitorch.CudaKernelOps)
-    return minitorch.TensorBackend(minitorch.FastOps)
-
-
-def _as_numpy(tensor) -> np.ndarray:
-    return tensor.detach().cpu().float().numpy()
-
-
-def _update_parameter(parameter, array: np.ndarray, backend) -> None:
-    value = np.ascontiguousarray(array.astype(np.float32, copy=False))
-    parameter.update(tensor_from_numpy(value, backend=backend))
-
-
-def _conv1d_weight_to_linear(
-    weight: np.ndarray,
-    in_size: int,
-    out_size: int,
-    name: str,
-) -> np.ndarray:
-    if weight.shape == (in_size, out_size):
-        return weight
-    if weight.shape == (out_size, in_size):
-        return weight.T
-    raise ValueError(
-        f"Unexpected {name} weight shape {weight.shape}; expected "
-        f"({in_size}, {out_size}) or ({out_size}, {in_size})"
-    )
-
-
-def _split_qkv_weight(weight: np.ndarray, n_embd: int) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-    if weight.shape == (n_embd, 3 * n_embd):
-        return tuple(np.split(weight, 3, axis=1))
-    if weight.shape == (3 * n_embd, n_embd):
-        return tuple(chunk.T for chunk in np.split(weight, 3, axis=0))
-    raise ValueError(
-        f"Unexpected GPT-2 c_attn weight shape {weight.shape}; expected "
-        f"({n_embd}, {3 * n_embd}) or ({3 * n_embd}, {n_embd})"
-    )
-
-
-def _get_config_int(config, *names: str) -> int:
-    for name in names:
-        value = getattr(config, name, None)
-        if value is not None:
-            return int(value)
-    raise ValueError(f"Could not find any config attribute from {names}")
-
-
-def load_gpt2_into_paged_model(
-    model_name: str,
-    backend,
-    block_size: int,
-    decode_backend: str,
-    revision: Optional[str] = None,
-    local_files_only: bool = False,
-) -> LoadedGPT2:
-    torch, AutoModelForCausalLM, AutoTokenizer = _import_hf_dependencies()
+def _cuda_available() -> bool:
     try:
-        tokenizer = AutoTokenizer.from_pretrained(
-            model_name,
-            revision=revision,
-            local_files_only=local_files_only,
-        )
-        hf_model = AutoModelForCausalLM.from_pretrained(
-            model_name,
-            revision=revision,
-            local_files_only=local_files_only,
-        )
-    except OSError as exc:
-        offline_hint = (
-            " The checkpoint was not found in the local HuggingFace cache; "
-            "rerun without --local-files-only to download it."
-            if local_files_only
-            else " Check network access or pre-download the checkpoint."
-        )
-        raise SystemExit(f"Could not load {model_name!r}.{offline_hint}") from exc
-    hf_model.eval()
-
-    config = hf_model.config
-    n_vocab = _get_config_int(config, "vocab_size")
-    n_embd = _get_config_int(config, "n_embd", "hidden_size")
-    n_head = _get_config_int(config, "n_head", "num_attention_heads")
-    n_layers = _get_config_int(config, "n_layer", "num_hidden_layers")
-    n_positions = _get_config_int(config, "n_positions", "n_ctx", "max_position_embeddings")
-    ln_eps = float(getattr(config, "layer_norm_epsilon", 1e-5))
-
-    if n_embd % n_head != 0:
-        raise ValueError(f"n_embd={n_embd} must be divisible by n_head={n_head}")
-    if not hasattr(hf_model, "transformer") or not hasattr(hf_model.transformer, "h"):
-        raise ValueError(
-            "This script expects a GPT-2-style HuggingFace model with "
-            "transformer.h blocks. Try --model-name gpt2 or distilgpt2."
-        )
-
-    paged_model = PagedDecoderLM(
-        n_vocab=n_vocab,
-        n_embd=n_embd,
-        n_head=n_head,
-        n_positions=n_positions,
-        n_layers=n_layers,
-        block_size=block_size,
-        p_dropout=0.0,
-        ln_eps=ln_eps,
-        backend=backend,
-        decode_backend=decode_backend,
-    )
-
-    transformer = hf_model.transformer
-    with torch.no_grad():
-        _update_parameter(paged_model.token_embeddings.weights, _as_numpy(transformer.wte.weight), backend)
-        _update_parameter(paged_model.position_embeddings.weights, _as_numpy(transformer.wpe.weight), backend)
-
-        for layer_id, hf_layer in enumerate(transformer.h):
-            layer = paged_model.layers[layer_id]
-            _update_parameter(layer.ln_1.weights, _as_numpy(hf_layer.ln_1.weight), backend)
-            _update_parameter(layer.ln_1.bias, _as_numpy(hf_layer.ln_1.bias), backend)
-            _update_parameter(layer.ln_2.weights, _as_numpy(hf_layer.ln_2.weight), backend)
-            _update_parameter(layer.ln_2.bias, _as_numpy(hf_layer.ln_2.bias), backend)
-
-            c_attn_weight = _as_numpy(hf_layer.attn.c_attn.weight)
-            c_attn_bias = _as_numpy(hf_layer.attn.c_attn.bias)
-            q_weight, k_weight, v_weight = _split_qkv_weight(c_attn_weight, n_embd)
-            q_bias, k_bias, v_bias = np.split(c_attn_bias, 3)
-            _update_parameter(layer.attention.q_proj.weights, q_weight, backend)
-            _update_parameter(layer.attention.q_proj.bias, q_bias, backend)
-            _update_parameter(layer.attention.k_proj.weights, k_weight, backend)
-            _update_parameter(layer.attention.k_proj.bias, k_bias, backend)
-            _update_parameter(layer.attention.v_proj.weights, v_weight, backend)
-            _update_parameter(layer.attention.v_proj.bias, v_bias, backend)
-
-            attn_out_weight = _conv1d_weight_to_linear(
-                _as_numpy(hf_layer.attn.c_proj.weight), n_embd, n_embd, "attn.c_proj"
-            )
-            _update_parameter(layer.attention.out_proj.weights, attn_out_weight, backend)
-            _update_parameter(layer.attention.out_proj.bias, _as_numpy(hf_layer.attn.c_proj.bias), backend)
-
-            mlp_hidden = 4 * n_embd
-            fc_weight = _conv1d_weight_to_linear(
-                _as_numpy(hf_layer.mlp.c_fc.weight), n_embd, mlp_hidden, "mlp.c_fc"
-            )
-            proj_weight = _conv1d_weight_to_linear(
-                _as_numpy(hf_layer.mlp.c_proj.weight), mlp_hidden, n_embd, "mlp.c_proj"
-            )
-            _update_parameter(layer.ff.linear_in.weights, fc_weight, backend)
-            _update_parameter(layer.ff.linear_in.bias, _as_numpy(hf_layer.mlp.c_fc.bias), backend)
-            _update_parameter(layer.ff.linear_out.weights, proj_weight, backend)
-            _update_parameter(layer.ff.linear_out.bias, _as_numpy(hf_layer.mlp.c_proj.bias), backend)
-
-        _update_parameter(paged_model.ln.weights, _as_numpy(transformer.ln_f.weight), backend)
-        _update_parameter(paged_model.ln.bias, _as_numpy(transformer.ln_f.bias), backend)
-
-        lm_head_weight = _as_numpy(hf_model.lm_head.weight)
-        if lm_head_weight.shape == (n_vocab, n_embd):
-            lm_head_weight = lm_head_weight.T
-        elif lm_head_weight.shape != (n_embd, n_vocab):
-            raise ValueError(
-                f"Unexpected lm_head weight shape {lm_head_weight.shape}; expected "
-                f"({n_vocab}, {n_embd}) or ({n_embd}, {n_vocab})"
-            )
-        _update_parameter(paged_model.lm_head.weights, lm_head_weight, backend)
-
-    paged_model.eval()
-    return LoadedGPT2(
-        model=paged_model,
-        tokenizer=tokenizer,
-        n_vocab=n_vocab,
-        n_embd=n_embd,
-        n_head=n_head,
-        n_layers=n_layers,
-        n_positions=n_positions,
-    )
+        return bool(cuda.is_available())
+    except Exception:
+        return False
 
 
 def _read_prompt_file(path: str) -> List[str]:
-    prompts = []
     with open(path, "r", encoding="utf-8") as handle:
-        for line in handle:
-            text = line.strip()
-            if text:
-                prompts.append(text)
-    return prompts
+        return [line.strip() for line in handle if line.strip()]
 
 
-def _load_dataset_prompts(args: argparse.Namespace) -> List[str]:
-    try:
-        from datasets import load_dataset
-    except ImportError as exc:
-        raise SystemExit(
-            "--dataset-name requires the datasets package. Install optional "
-            "dependencies with: pip install -r requirements.gpt2.txt"
-        ) from exc
-
+def _load_real_texts(args: argparse.Namespace, load_dataset) -> List[str]:
+    if args.prompts_file:
+        return _read_prompt_file(args.prompts_file)
     dataset = load_dataset(
         args.dataset_name,
         args.dataset_config,
         split=args.dataset_split,
     )
-    prompts = []
+    texts: List[str] = []
     for row in dataset:
         text = str(row.get(args.text_column, "")).strip()
         if text:
-            prompts.append(text)
-        if len(prompts) >= args.max_prompts * 8:
+            texts.append(text)
+        if len(texts) >= args.max_dataset_rows:
             break
-    return prompts
+    if not texts:
+        raise ValueError("No non-empty text rows found for the GPT-2 benchmark.")
+    return texts
 
 
-def load_prompt_texts(args: argparse.Namespace) -> List[str]:
-    if args.prompts_file:
-        return _read_prompt_file(args.prompts_file)
-    if args.dataset_name:
-        return _load_dataset_prompts(args)
-    return list(BUILTIN_PROMPTS)
-
-
-def encode_prompts(
-    tokenizer,
-    texts: Iterable[str],
-    max_prompts: int,
-    min_prompt_tokens: int,
-    max_prompt_tokens: int,
-) -> List[Tuple[str, List[int]]]:
-    encoded_prompts = []
+def _token_stream_from_texts(tokenizer, texts: Iterable[str], min_tokens: int) -> List[int]:
+    token_ids: List[int] = []
+    eos_token_id = tokenizer.eos_token_id
     for text in texts:
-        token_ids = tokenizer.encode(text, add_special_tokens=False)
-        if max_prompt_tokens > 0:
-            token_ids = token_ids[:max_prompt_tokens]
-        if len(token_ids) < min_prompt_tokens:
-            continue
-        encoded_prompts.append((text, token_ids))
-        if len(encoded_prompts) >= max_prompts:
+        encoded = tokenizer.encode(text, add_special_tokens=False)
+        if encoded:
+            token_ids.extend(int(token_id) for token_id in encoded)
+            if eos_token_id is not None:
+                token_ids.append(int(eos_token_id))
+        if len(token_ids) >= min_tokens:
             break
-    if not encoded_prompts:
-        raise ValueError(
-            "No usable prompts after tokenization. Lower --min-prompt-tokens "
-            "or provide longer prompts."
-        )
-    return encoded_prompts
+    if len(token_ids) < min_tokens:
+        raise ValueError(f"Need {min_tokens} real tokens, got {len(token_ids)}.")
+    return token_ids
 
 
-def _sample_next_token(logits: np.ndarray, temperature: float, rng: np.random.Generator) -> int:
-    logits = logits.astype(np.float64, copy=False)
-    if temperature <= 0:
-        return int(np.argmax(logits))
-    scaled = logits / temperature
-    scaled = scaled - np.max(scaled)
-    probs = np.exp(scaled)
-    probs = probs / np.sum(probs)
-    return int(rng.choice(len(probs), p=probs))
+def _make_backend():
+    return minitorch.TensorBackend(minitorch.CudaOps)
 
 
-def _auto_num_blocks(prompt_tokens: int, max_new_tokens: int, block_size: int) -> int:
-    context_tokens = max(prompt_tokens + max_new_tokens, 1)
-    return max(1, math.ceil(context_tokens / block_size) + 1)
+def _as_minitorch(array: np.ndarray, backend) -> Tensor:
+    return tensor_from_numpy(np.ascontiguousarray(array.astype(DTYPE)), backend=backend)
 
 
-def _kv_metrics(block_manager: BlockManager) -> dict:
-    dtype_size = np.dtype(block_manager.cache_dtype).itemsize
-    filled_slots = sum(block.num_filled for block in block_manager.blocks.values())
-    used_blocks = block_manager.num_used_blocks
-    bytes_per_token = (
-        block_manager.n_head
-        * block_manager.head_dim
-        * block_manager.num_layers
-        * 2
-        * dtype_size
+def _device_ptr(obj) -> int:
+    if isinstance(obj, Tensor):
+        storage = obj._tensor._storage
+    else:
+        storage = obj
+    if not numba.cuda.is_cuda_array(storage):
+        raise RuntimeError("Expected CUDA device-backed storage")
+    return int(storage.__cuda_array_interface__["data"][0])
+
+
+def _empty_device_tensor(shape: Sequence[int], backend) -> Tensor:
+    size = int(np.prod(shape))
+    storage = cuda.device_array(size, dtype=DTYPE)
+    return Tensor.make(storage, tuple(int(dim) for dim in shape), backend=backend)
+
+
+def _set_parameter(param: Parameter, array: np.ndarray, backend) -> None:
+    param.update(_as_minitorch(array, backend))
+    param.value.history = None
+
+
+def _copy_hf_weights_into_minitorch(model: PagedDecoderLM, hf_model, backend) -> None:
+    transformer = hf_model.transformer
+    _set_parameter(model.token_embeddings.weights, transformer.wte.weight.detach().cpu().numpy(), backend)
+    _set_parameter(model.position_embeddings.weights, transformer.wpe.weight.detach().cpu().numpy(), backend)
+
+    for layer_idx, layer in enumerate(model.layers):
+        hf_block = transformer.h[layer_idx]
+        _set_parameter(layer.ln_1.weights, hf_block.ln_1.weight.detach().cpu().numpy(), backend)
+        _set_parameter(layer.ln_1.bias, hf_block.ln_1.bias.detach().cpu().numpy(), backend)
+        _set_parameter(layer.ln_2.weights, hf_block.ln_2.weight.detach().cpu().numpy(), backend)
+        _set_parameter(layer.ln_2.bias, hf_block.ln_2.bias.detach().cpu().numpy(), backend)
+
+        c_attn_w = hf_block.attn.c_attn.weight.detach().cpu().numpy()
+        c_attn_b = hf_block.attn.c_attn.bias.detach().cpu().numpy()
+        q_w, k_w, v_w = np.split(c_attn_w, 3, axis=1)
+        q_b, k_b, v_b = np.split(c_attn_b, 3, axis=0)
+        _set_parameter(layer.attention.q_proj.weights, q_w, backend)
+        _set_parameter(layer.attention.q_proj.bias, q_b, backend)
+        _set_parameter(layer.attention.k_proj.weights, k_w, backend)
+        _set_parameter(layer.attention.k_proj.bias, k_b, backend)
+        _set_parameter(layer.attention.v_proj.weights, v_w, backend)
+        _set_parameter(layer.attention.v_proj.bias, v_b, backend)
+
+        _set_parameter(layer.attention.out_proj.weights, hf_block.attn.c_proj.weight.detach().cpu().numpy(), backend)
+        _set_parameter(layer.attention.out_proj.bias, hf_block.attn.c_proj.bias.detach().cpu().numpy(), backend)
+        _set_parameter(layer.ff.linear_in.weights, hf_block.mlp.c_fc.weight.detach().cpu().numpy(), backend)
+        _set_parameter(layer.ff.linear_in.bias, hf_block.mlp.c_fc.bias.detach().cpu().numpy(), backend)
+        _set_parameter(layer.ff.linear_out.weights, hf_block.mlp.c_proj.weight.detach().cpu().numpy(), backend)
+        _set_parameter(layer.ff.linear_out.bias, hf_block.mlp.c_proj.bias.detach().cpu().numpy(), backend)
+
+    _set_parameter(model.ln.weights, transformer.ln_f.weight.detach().cpu().numpy(), backend)
+    _set_parameter(model.ln.bias, transformer.ln_f.bias.detach().cpu().numpy(), backend)
+    _set_parameter(model.lm_head.weights, transformer.wte.weight.detach().cpu().numpy().T, backend)
+
+
+def _make_model_from_hf(hf_model, backend, block_size: int) -> PagedDecoderLM:
+    config = hf_model.config
+    model = PagedDecoderLM(
+        n_vocab=int(config.vocab_size),
+        n_embd=int(config.n_embd),
+        n_head=int(config.n_head),
+        n_positions=int(getattr(config, "n_positions", getattr(config, "n_ctx", 1024))),
+        n_layers=int(config.n_layer),
+        block_size=block_size,
+        p_dropout=0.0,
+        backend=backend,
+        decode_backend="cuda",
+        gpu_resident_kv=True,
     )
-    allocated_slots = used_blocks * block_manager.block_size
+    model.eval()
+    _copy_hf_weights_into_minitorch(model, hf_model, backend)
+    return model
+
+
+class NoKVDecoder:
+    """Full MiniTorch model path that recomputes the whole context."""
+
+    def __init__(self, model: PagedDecoderLM) -> None:
+        self.model = model
+        self.backend = model.backend
+        self.n_embd = model.n_embd
+        self.n_vocab = model.n_vocab
+        self.n_head = model.layers[0].attention.n_head
+        self.head_dim = model.layers[0].attention.head_dim
+
+    def _embed(self, idx):
+        batch_size, seq_len = idx.shape
+        tok_emb = self.model.token_embeddings(idx)
+        pos_ids = _as_minitorch(
+            np.arange(seq_len, dtype=DTYPE).reshape(1, seq_len),
+            self.backend,
+        )
+        return self.model.dropout(tok_emb + self.model.position_embeddings(pos_ids))
+
+    def _project_qkv(self, attn, x, seq_len):
+        batch_size = x.shape[0]
+        flat_x = x.contiguous().view(batch_size * seq_len, self.n_embd)
+        q = attn.q_proj(flat_x).view(batch_size, seq_len, self.n_head, self.head_dim)
+        k = attn.k_proj(flat_x).view(batch_size, seq_len, self.n_head, self.head_dim)
+        v = attn.v_proj(flat_x).view(batch_size, seq_len, self.n_head, self.head_dim)
+        return q.permute(0, 2, 1, 3), k.permute(0, 2, 1, 3), v.permute(0, 2, 1, 3)
+
+    def _forward_hidden(self, idx):
+        batch_size, seq_len = idx.shape
+        x = self._embed(idx)
+        for layer in self.model.layers:
+            attn = layer.attention
+            norm_x = layer.ln_1(x.view(batch_size * seq_len, self.n_embd)).view(
+                batch_size, seq_len, self.n_embd
+            )
+            q, k, v = self._project_qkv(attn, norm_x, seq_len)
+            mask = _as_minitorch(
+                np.triu(np.full((seq_len, seq_len), -1e9, dtype=DTYPE), k=1).reshape(
+                    1, 1, seq_len, seq_len
+                ),
+                self.backend,
+            )
+            attn_out = standard_attention(q, k, v, mask)
+            attn_out = attn_out.permute(0, 2, 1, 3).contiguous().view(
+                batch_size * seq_len, self.n_embd
+            )
+            x = x + attn.out_proj(attn_out).view(batch_size, seq_len, self.n_embd)
+            norm_x = layer.ln_2(x.view(batch_size * seq_len, self.n_embd)).view(
+                batch_size, seq_len, self.n_embd
+            )
+            x = x + layer.ff(norm_x)
+        x = self.model.ln(x.view(batch_size * seq_len, self.n_embd)).view(
+            batch_size, seq_len, self.n_embd
+        )
+        return x
+
+    def forward(self, idx):
+        batch_size, seq_len = idx.shape
+        x = self._forward_hidden(idx)
+        return self.model.lm_head(x.view(batch_size * seq_len, self.n_embd)).view(
+            batch_size, seq_len, self.n_vocab
+        )
+
+    def forward_last(self, idx):
+        batch_size, seq_len = idx.shape
+        x = self._forward_hidden(idx)
+        last_mask = np.zeros((1, seq_len, 1), dtype=DTYPE)
+        last_mask[:, seq_len - 1, :] = 1.0
+        last_x = (x * _as_minitorch(last_mask, self.backend)).sum(1).view(
+            batch_size, self.n_embd
+        )
+        return self.model.lm_head(last_x).view(batch_size, 1, self.n_vocab)
+
+
+class GpuContiguousKVDecoder(NoKVDecoder):
+    """Full MiniTorch model with a device-resident contiguous KV cache."""
+
+    def __init__(self, model: PagedDecoderLM, max_batch_size: int, max_seq_len: int) -> None:
+        super().__init__(model)
+        self.max_batch_size = int(max_batch_size)
+        self.max_seq_len = int(max_seq_len)
+        self.n_layers = model.n_layers
+        shape = (self.max_batch_size, self.max_seq_len, self.n_head, self.head_dim)
+        self.key_cache = [_empty_device_tensor(shape, self.backend) for _ in range(self.n_layers)]
+        self.value_cache = [_empty_device_tensor(shape, self.backend) for _ in range(self.n_layers)]
+        self.kernel = PagedAttentionKernel()
+        self.context_len = 0
+        self.batch_size = 0
+
+    def reset(self) -> None:
+        self.context_len = 0
+        self.batch_size = 0
+
+    def reserved_bytes(self) -> int:
+        return (
+            2
+            * self.n_layers
+            * self.max_batch_size
+            * self.max_seq_len
+            * self.n_head
+            * self.head_dim
+            * DTYPE_SIZE
+        )
+
+    def used_bytes(self) -> int:
+        return (
+            2
+            * self.n_layers
+            * self.batch_size
+            * self.context_len
+            * self.n_head
+            * self.head_dim
+            * DTYPE_SIZE
+        )
+
+    def _write_slots(self, layer_idx: int, key_values: Tensor, value_values: Tensor, token_start: int) -> None:
+        batch_size, token_count, _, _ = key_values.shape
+        row_elems = self.n_head * self.head_dim
+        itemsize = DTYPE_SIZE
+        key_ptr = _device_ptr(key_values)
+        value_ptr = _device_ptr(value_values)
+        key_cache_ptr = _device_ptr(self.key_cache[layer_idx])
+        value_cache_ptr = _device_ptr(self.value_cache[layer_idx])
+        for batch_idx in range(batch_size):
+            for local_idx in range(token_count):
+                row_offset = (batch_idx * token_count + local_idx) * row_elems * itemsize
+                self.kernel.contiguous_update_slot_from_device(
+                    key_cache_ptr,
+                    value_cache_ptr,
+                    batch_idx,
+                    token_start + local_idx,
+                    key_ptr + row_offset,
+                    value_ptr + row_offset,
+                    self.max_seq_len,
+                    self.n_head,
+                    self.head_dim,
+                )
+
+    def _run_layer_prefill(self, layer, x, seq_len: int):
+        batch_size = x.shape[0]
+        attn = layer.attention
+        norm_x = layer.ln_1(x.view(batch_size * seq_len, self.n_embd)).view(
+            batch_size, seq_len, self.n_embd
+        )
+        q, k, v = self._project_qkv(attn, norm_x, seq_len)
+        self._write_slots(
+            attn.layer_id,
+            k.permute(0, 2, 1, 3).contiguous(),
+            v.permute(0, 2, 1, 3).contiguous(),
+            0,
+        )
+        mask = _as_minitorch(
+            np.triu(np.full((seq_len, seq_len), -1e9, dtype=DTYPE), k=1).reshape(
+                1, 1, seq_len, seq_len
+            ),
+            self.backend,
+        )
+        attn_out = standard_attention(q, k, v, mask)
+        attn_out = attn_out.permute(0, 2, 1, 3).contiguous().view(
+            batch_size * seq_len, self.n_embd
+        )
+        x = x + attn.out_proj(attn_out).view(batch_size, seq_len, self.n_embd)
+        norm_x = layer.ln_2(x.view(batch_size * seq_len, self.n_embd)).view(
+            batch_size, seq_len, self.n_embd
+        )
+        return x + layer.ff(norm_x)
+
+    def forward_prefill(self, idx):
+        batch_size, seq_len = idx.shape
+        self.batch_size = batch_size
+        self.context_len = seq_len
+        x = self._embed(idx)
+        for layer in self.model.layers:
+            x = self._run_layer_prefill(layer, x, seq_len)
+        x = self.model.ln(x.view(batch_size * seq_len, self.n_embd)).view(
+            batch_size, seq_len, self.n_embd
+        )
+        return self.model.lm_head(x.view(batch_size * seq_len, self.n_embd)).view(
+            batch_size, seq_len, self.n_vocab
+        )
+
+    def _run_layer_decode(self, layer, x):
+        batch_size = x.shape[0]
+        attn = layer.attention
+        norm_x = layer.ln_1(x.view(batch_size, self.n_embd)).view(
+            batch_size, 1, self.n_embd
+        )
+        q, k, v = self._project_qkv(attn, norm_x, 1)
+        layer_idx = attn.layer_id
+        self._write_slots(
+            layer_idx,
+            k.permute(0, 2, 1, 3).contiguous(),
+            v.permute(0, 2, 1, 3).contiguous(),
+            self.context_len,
+        )
+
+        out = _empty_device_tensor((batch_size, self.n_head, self.head_dim), self.backend)
+        context_lens = cuda.to_device(
+            np.full((batch_size,), self.context_len + 1, dtype=np.int32)
+        )
+        self.kernel.contiguous_forward_device(
+            _device_ptr(out),
+            _device_ptr(q.contiguous().view(batch_size, self.n_head, self.head_dim)),
+            _device_ptr(self.key_cache[layer_idx]),
+            _device_ptr(self.value_cache[layer_idx]),
+            _device_ptr(context_lens),
+            batch_size,
+            self.n_head,
+            self.head_dim,
+            self.max_seq_len,
+        )
+        attn_out = out.view(batch_size, self.n_head, 1, self.head_dim)
+        attn_out = attn_out.permute(0, 2, 1, 3).contiguous().view(batch_size, self.n_embd)
+        x = x + attn.out_proj(attn_out).view(batch_size, 1, self.n_embd)
+        norm_x = layer.ln_2(x.view(batch_size, self.n_embd)).view(
+            batch_size, 1, self.n_embd
+        )
+        return x + layer.ff(norm_x)
+
+    def forward_decode(self, idx, start_pos: int):
+        batch_size, seq_len = idx.shape
+        if seq_len != 1:
+            raise ValueError("forward_decode expects one token")
+        x = self.model._embed(idx, start_pos=start_pos)
+        for layer in self.model.layers:
+            x = self._run_layer_decode(layer, x)
+        self.context_len += 1
+        x = self.model.ln(x.view(batch_size, self.n_embd)).view(batch_size, 1, self.n_embd)
+        return self.model.lm_head(x.view(batch_size, self.n_embd)).view(
+            batch_size, 1, self.n_vocab
+        )
+
+
+def _make_block_manager(batch_size: int, context_len: int, model: PagedDecoderLM, block_size: int) -> BlockManager:
+    blocks_per_seq = math.ceil(context_len / block_size)
+    return BlockManager(
+        num_blocks=batch_size * blocks_per_seq,
+        block_size=block_size,
+        n_head=model.layers[0].attention.n_head,
+        head_dim=model.layers[0].attention.head_dim,
+        num_layers=model.n_layers,
+        allocate_host_cache=False,
+    )
+
+
+def _rewind_one_paged_decode(block_manager: BlockManager, seq_ids: Sequence[int]) -> None:
+    for seq_id in seq_ids:
+        token_index = block_manager.context_lens[seq_id] - 1
+        block_id, _ = block_manager.get_physical_location(seq_id, token_index)
+        block = block_manager.blocks[block_id]
+        block.num_filled -= 1
+        block_manager.context_lens[seq_id] -= 1
+        if block.num_filled == 0 and block_manager.block_tables[seq_id].block_ids[-1] == block_id:
+            block.ref_count = 0
+            block_manager.block_tables[seq_id].block_ids.pop()
+            if block_id not in block_manager.free_block_ids:
+                block_manager.free_block_ids.append(block_id)
+                block_manager.free_block_ids.sort()
+
+
+def _time_cuda(fn, warmup_iters: int, timed_iters: int) -> Dict[str, float]:
+    for _ in range(warmup_iters):
+        fn()
+    cuda.synchronize()
+    samples = []
+    for _ in range(timed_iters):
+        start = time.perf_counter()
+        fn()
+        cuda.synchronize()
+        samples.append(time.perf_counter() - start)
+    arr = np.array(samples, dtype=np.float64)
     return {
-        "paged_used_blocks": used_blocks,
-        "paged_allocated_slots": allocated_slots,
-        "paged_filled_slots": filled_slots,
-        "paged_internal_fragmentation": (
-            (allocated_slots - filled_slots) / allocated_slots if allocated_slots else 0.0
-        ),
-        "paged_live_kv_bytes": filled_slots * bytes_per_token,
-        "paged_allocated_kv_bytes": allocated_slots * bytes_per_token,
-        "paged_pool_kv_bytes": block_manager.num_blocks * block_manager.block_size * bytes_per_token,
+        "median_ms": float(np.median(arr) * 1000.0),
+        "mean_ms": float(np.mean(arr) * 1000.0),
+        "min_ms": float(np.min(arr) * 1000.0),
+        "p95_ms": float(np.percentile(arr, 95) * 1000.0),
     }
 
 
-def _contiguous_kv_bytes(
-    context_tokens: int,
-    n_head: int,
-    head_dim: int,
-    n_layers: int,
-) -> int:
-    dtype_size = np.dtype(CACHE_DTYPE).itemsize
-    return context_tokens * n_head * head_dim * n_layers * 2 * dtype_size
-
-
-def run_one_prompt(
-    loaded: LoadedGPT2,
-    prompt_id: int,
-    prompt_text: str,
-    prompt_tokens: Sequence[int],
-    args: argparse.Namespace,
-    backend,
-    rng: np.random.Generator,
-) -> dict:
-    seq_ids = [prompt_id + 1]
-    token_count = len(prompt_tokens)
-    num_blocks = args.num_kv_blocks or _auto_num_blocks(
-        token_count, args.max_new_tokens, args.block_size
-    )
-    block_manager = BlockManager(
-        num_blocks=num_blocks,
-        block_size=args.block_size,
-        n_head=loaded.n_head,
-        head_dim=loaded.head_dim,
-        num_layers=loaded.n_layers,
-    )
-    prompt_array = np.array(prompt_tokens, dtype=datatype).reshape(1, token_count)
-    prompt_tensor = tensor_from_numpy(prompt_array, backend=backend)
-    generated_tokens = list(prompt_tokens)
-    decode_forward_tokens = 0
-    decode_s = 0.0
-
-    try:
-        prefill_start = time.perf_counter()
-        logits = loaded.model.forward_prefill(prompt_tensor, block_manager, seq_ids)
-        prefill_s = time.perf_counter() - prefill_start
-        last_logits = logits.to_numpy()[0, -1, :]
-
-        for step in range(args.max_new_tokens):
-            next_token = _sample_next_token(last_logits, args.temperature, rng)
-            generated_tokens.append(next_token)
-            if step == args.max_new_tokens - 1:
-                break
-
-            token_tensor = tensor_from_numpy(
-                np.array([[next_token]], dtype=datatype),
-                backend=backend,
-            )
-            decode_start = time.perf_counter()
-            logits = loaded.model.forward_decode(
-                token_tensor,
-                block_manager,
-                seq_ids,
-                start_pos=token_count + step,
-            )
-            decode_s += time.perf_counter() - decode_start
-            decode_forward_tokens += 1
-            last_logits = logits.to_numpy()[0, 0, :]
-
-        kv_metrics = _kv_metrics(block_manager)
-        total_s = prefill_s + decode_s
-        output_text = loaded.tokenizer.decode(generated_tokens, skip_special_tokens=True)
-        contiguous_context_tokens = args.contiguous_context_tokens or loaded.n_positions
-        contiguous_bytes = _contiguous_kv_bytes(
-            contiguous_context_tokens,
-            loaded.n_head,
-            loaded.head_dim,
-            loaded.n_layers,
-        )
-        row = {
-            "prompt_id": prompt_id,
-            "model_name": args.model_name,
-            "backend": args.backend,
-            "decode_backend": args.decode_backend,
-            "prompt_tokens": token_count,
-            "max_new_tokens": args.max_new_tokens,
-            "generated_tokens": max(len(generated_tokens) - token_count, 0),
-            "decode_forward_tokens": decode_forward_tokens,
-            "prefill_s": prefill_s,
-            "decode_s": decode_s,
-            "total_s": total_s,
-            "end_to_end_tokens_per_s": (
-                (token_count + args.max_new_tokens) / total_s if total_s > 0 else 0.0
-            ),
-            "decode_forward_tokens_per_s": (
-                decode_forward_tokens / decode_s if decode_s > 0 else 0.0
-            ),
-            "block_size": args.block_size,
-            "num_kv_blocks": num_blocks,
-            "contiguous_context_tokens": contiguous_context_tokens,
-            "contiguous_kv_bytes_estimate": contiguous_bytes,
-            "paged_vs_contiguous_allocated_savings": (
-                1.0 - kv_metrics["paged_allocated_kv_bytes"] / contiguous_bytes
-                if contiguous_bytes > 0
-                else 0.0
-            ),
-            "prompt_preview": prompt_text[:160].replace("\n", " "),
-            "generated_text_preview": output_text[:240].replace("\n", " "),
+def _stats_row(common, implementation, scope, stats, allocated_kv_bytes, live_kv_bytes, working_kv_bytes, kv_residency, output_error):
+    median_s = stats["median_ms"] / 1000.0
+    batch_size = int(common["batch_size"])
+    row = dict(common)
+    row.update(
+        {
+            "implementation": implementation,
+            "scope": scope,
+            "median_ms": round(stats["median_ms"], 6),
+            "mean_ms": round(stats["mean_ms"], 6),
+            "min_ms": round(stats["min_ms"], 6),
+            "p95_ms": round(stats["p95_ms"], 6),
+            "query_tokens_per_s": round(batch_size / median_s, 3) if median_s > 0 else 0.0,
+            "allocated_kv_bytes": int(allocated_kv_bytes),
+            "live_kv_bytes": int(live_kv_bytes),
+            "working_kv_bytes": int(working_kv_bytes),
+            "kv_residency": kv_residency,
+            "setup_kv_copy": "none" if implementation != "paged_attention" else "device_to_device",
+            "timed_h2d_kv_bytes": 0,
+            "timed_h2d_query_bytes": 0,
+            "timed_d2h_output_bytes": 0,
+            "output_max_abs_error": round(float(output_error), 8),
+            "output_mean_abs_error": round(float(output_error), 8),
         }
-        row.update(kv_metrics)
-        return row
-    finally:
-        for seq_id in seq_ids:
-            if seq_id in block_manager.block_tables:
-                block_manager.free_sequence(seq_id)
-        loaded.model.close_decode_runtime()
+    )
+    return row
 
 
-def write_rows(path: Path, rows: List[dict]) -> None:
+def _benchmark_one(
+    model: PagedDecoderLM,
+    no_kv: NoKVDecoder,
+    contiguous: GpuContiguousKVDecoder,
+    prompt: Tensor,
+    decode_token: Tensor,
+    full_input: Tensor,
+    args: argparse.Namespace,
+    metadata: Dict[str, object],
+) -> List[Dict[str, object]]:
+    batch_size, prompt_len = prompt.shape
+    context_len = prompt_len + 1
+    seq_ids = list(range(batch_size))
+
+    contiguous.reset()
+    contiguous.forward_prefill(prompt)
+    paged_manager = _make_block_manager(batch_size, context_len, model, args.block_size)
+    model.forward_prefill(prompt, paged_manager, seq_ids)
+
+    def baseline_once():
+        return no_kv.forward_last(full_input)
+
+    def contiguous_once():
+        contiguous.context_len = prompt_len
+        return contiguous.forward_decode(decode_token, start_pos=prompt_len)
+
+    def paged_once():
+        out = model.forward_decode(decode_token, paged_manager, seq_ids, start_pos=prompt_len)
+        _rewind_one_paged_decode(paged_manager, seq_ids)
+        return out
+
+    baseline_logits = baseline_once()
+    contiguous_logits = contiguous_once()
+    contiguous.context_len = prompt_len
+    paged_logits = paged_once()
+    cuda.synchronize()
+
+    baseline_last = baseline_logits.to_numpy()
+    contiguous_np = contiguous_logits.to_numpy()
+    paged_np = paged_logits.to_numpy()
+    baseline_error = float(np.max(np.abs(baseline_last - contiguous_np)))
+    paged_error = float(np.max(np.abs(paged_np - contiguous_np)))
+
+    baseline_stats = _time_cuda(baseline_once, args.warmup_iters, args.timed_iters)
+    contiguous_stats = _time_cuda(contiguous_once, args.warmup_iters, args.timed_iters)
+    contiguous.context_len = prompt_len
+    paged_stats = _time_cuda(paged_once, args.warmup_iters, args.timed_iters)
+
+    n_head = model.layers[0].attention.n_head
+    head_dim = model.layers[0].attention.head_dim
+    bytes_per_token = model.n_layers * n_head * head_dim * 2 * DTYPE_SIZE
+    live_kv_bytes = batch_size * context_len * bytes_per_token
+    static_context_len = max(int(metadata["static_context_len"]), context_len)
+    static_contiguous_kv_bytes = batch_size * static_context_len * bytes_per_token
+    blocks_per_seq = math.ceil(context_len / args.block_size)
+    paged_allocated_tokens = batch_size * blocks_per_seq * args.block_size
+    paged_allocated_kv_bytes = paged_allocated_tokens * bytes_per_token
+
+    common = {
+        "source": "minitorch_gpt2_real_dataset",
+        "runner": "minitorch_full_model",
+        "model_name": metadata["model_name"],
+        "dataset_name": metadata["dataset_name"],
+        "dataset_config": metadata["dataset_config"],
+        "dataset_split": metadata["dataset_split"],
+        "layer_id": "all",
+        "batch_size": batch_size,
+        "prompt_tokens": prompt_len,
+        "context_tokens": context_len,
+        "block_size": args.block_size,
+        "n_layers": model.n_layers,
+        "n_head": n_head,
+        "head_dim": head_dim,
+        "blocks_per_seq": blocks_per_seq,
+        "num_blocks": batch_size * blocks_per_seq,
+        "static_context_len": static_context_len,
+        "memory_scope": "full_model_all_layers",
+        "timed_iters": args.timed_iters,
+        "first_token_id": metadata["first_token_id"],
+        "next_token_id": metadata["next_token_id"],
+        "paged_internal_fragmentation": round(
+            1.0 - live_kv_bytes / paged_allocated_kv_bytes,
+            6,
+        ),
+        "paged_savings_vs_static_contiguous": round(
+            1.0 - paged_allocated_kv_bytes / static_contiguous_kv_bytes,
+            6,
+        ),
+    }
+    return [
+        _stats_row(
+            common,
+            "baseline_no_kv",
+            "full_model_recompute_context_next_token",
+            baseline_stats,
+            0,
+            live_kv_bytes,
+            live_kv_bytes,
+            "no_persistent_kv",
+            baseline_error,
+        ),
+        _stats_row(
+            common,
+            "contiguous_kv",
+            "full_model_single_token_decode",
+            contiguous_stats,
+            static_contiguous_kv_bytes,
+            live_kv_bytes,
+            live_kv_bytes,
+            "gpu_contiguous_kv",
+            0.0,
+        ),
+        _stats_row(
+            common,
+            "paged_attention",
+            "full_model_single_token_decode",
+            paged_stats,
+            paged_allocated_kv_bytes,
+            live_kv_bytes,
+            live_kv_bytes,
+            "gpu_paged_runtime_no_host_kv_cache",
+            paged_error,
+        ),
+    ]
+
+
+def _write_csv(path: Path, rows: List[Dict[str, object]]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    fieldnames = list(rows[0].keys())
+    fieldnames: List[str] = []
+    seen = set()
+    for row in rows:
+        for key in row:
+            if key not in seen:
+                seen.add(key)
+                fieldnames.append(key)
     with open(path, "w", newline="", encoding="utf-8") as handle:
         writer = csv.DictWriter(handle, fieldnames=fieldnames)
         writer.writeheader()
@@ -539,69 +660,100 @@ def write_rows(path: Path, rows: List[dict]) -> None:
 
 def main() -> None:
     args = parse_args()
-    np.random.seed(args.seed)
-    rng = np.random.default_rng(args.seed)
-    backend = _create_backend(args.backend)
+    if not _cuda_available():
+        raise SystemExit("CUDA is required for the MiniTorch GPU-resident KV benchmark.")
+    if args.block_size <= 0 or args.block_size > 64:
+        raise ValueError("--block-size must be in [1, 64] for the current kernel.")
+    if args.timed_iters <= 0 or args.warmup_iters < 0:
+        raise ValueError("--timed-iters must be positive and --warmup-iters non-negative.")
 
-    loaded = load_gpt2_into_paged_model(
-        model_name=args.model_name,
-        backend=backend,
-        block_size=args.block_size,
-        decode_backend=args.decode_backend,
+    np.random.seed(args.seed)
+    torch, load_dataset, AutoModelForCausalLM, AutoTokenizer = _import_hf()
+    torch.manual_seed(args.seed)
+    backend = _make_backend()
+
+    tokenizer = AutoTokenizer.from_pretrained(
+        args.model_name,
         revision=args.revision,
         local_files_only=args.local_files_only,
     )
-
-    prompt_texts = load_prompt_texts(args)
-    max_decode_positions = max(args.max_new_tokens - 1, 0)
-    max_position_safe_prompt_tokens = loaded.n_positions - max_decode_positions
-    if max_position_safe_prompt_tokens <= 0:
-        raise ValueError(
-            f"--max-new-tokens={args.max_new_tokens} exceeds model position "
-            f"capacity {loaded.n_positions}"
-        )
-    max_prompt_tokens = args.max_prompt_tokens
-    if max_prompt_tokens <= 0:
-        max_prompt_tokens = max_position_safe_prompt_tokens
-    else:
-        max_prompt_tokens = min(max_prompt_tokens, max_position_safe_prompt_tokens)
-
-    encoded_prompts = encode_prompts(
-        loaded.tokenizer,
-        prompt_texts,
-        max_prompts=args.max_prompts,
-        min_prompt_tokens=args.min_prompt_tokens,
-        max_prompt_tokens=max_prompt_tokens,
+    hf_model = AutoModelForCausalLM.from_pretrained(
+        args.model_name,
+        revision=args.revision,
+        local_files_only=args.local_files_only,
     )
+    hf_model.eval()
+
+    n_positions = int(getattr(hf_model.config, "n_positions", getattr(hf_model.config, "n_ctx", 1024)))
+    max_context_len = max(args.seq_lengths) + 1
+    if max_context_len > n_positions:
+        raise ValueError(f"Requested context {max_context_len} exceeds model position limit {n_positions}.")
+
+    tokens_needed = sum(batch * (seq_len + 1) for batch in args.batch_sizes for seq_len in args.seq_lengths)
+    texts = _load_real_texts(args, load_dataset)
+    token_ids = _token_stream_from_texts(tokenizer, texts, tokens_needed)
 
     print(
-        f"Loaded {args.model_name}: vocab={loaded.n_vocab}, embd={loaded.n_embd}, "
-        f"heads={loaded.n_head}, layers={loaded.n_layers}, positions={loaded.n_positions}"
+        f"Loaded {args.model_name} weights into MiniTorch CudaOps; "
+        f"using {len(token_ids)} real tokens from "
+        f"{args.dataset_name}/{args.dataset_config}:{args.dataset_split}."
     )
-    print(f"Running {len(encoded_prompts)} prompt(s) with MiniTorch PagedAttention...")
+    model = _make_model_from_hf(hf_model, backend, args.block_size)
+    no_kv = NoKVDecoder(model)
+    static_context_len = args.static_context_len or n_positions
+    contiguous = GpuContiguousKVDecoder(
+        model,
+        max_batch_size=max(args.batch_sizes),
+        max_seq_len=static_context_len,
+    )
 
-    rows = []
-    for prompt_id, (prompt_text, token_ids) in enumerate(encoded_prompts):
-        row = run_one_prompt(
-            loaded=loaded,
-            prompt_id=prompt_id,
-            prompt_text=prompt_text,
-            prompt_tokens=token_ids,
-            args=args,
-            backend=backend,
-            rng=rng,
-        )
-        rows.append(row)
-        print(
-            f"prompt={prompt_id} tokens={row['prompt_tokens']} "
-            f"prefill={row['prefill_s']:.4f}s decode={row['decode_s']:.4f}s "
-            f"paged_alloc={row['paged_allocated_kv_bytes'] / (1024 ** 2):.2f} MiB"
-        )
-        if args.print_generations:
-            print(row["generated_text_preview"])
+    rows: List[Dict[str, object]] = []
+    offset = 0
+    for batch_size in args.batch_sizes:
+        for prompt_len in args.seq_lengths:
+            needed = batch_size * (prompt_len + 1)
+            chunk = np.array(token_ids[offset : offset + needed], dtype=np.float32)
+            offset += needed
+            chunk = chunk.reshape(batch_size, prompt_len + 1)
+            prompt_np = chunk[:, :prompt_len]
+            decode_np = chunk[:, prompt_len : prompt_len + 1]
+            full_np = chunk
+
+            prompt = _as_minitorch(prompt_np, backend)
+            decode_token = _as_minitorch(decode_np, backend)
+            full_input = _as_minitorch(full_np, backend)
+            metadata = {
+                "model_name": args.model_name,
+                "dataset_name": args.dataset_name,
+                "dataset_config": args.dataset_config or "",
+                "dataset_split": args.dataset_split,
+                "static_context_len": static_context_len,
+                "first_token_id": int(prompt_np[0, 0]),
+                "next_token_id": int(decode_np[0, 0]),
+            }
+            new_rows = _benchmark_one(
+                model,
+                no_kv,
+                contiguous,
+                prompt,
+                decode_token,
+                full_input,
+                args,
+                metadata,
+            )
+            rows.extend(new_rows)
+            by_impl = {row["implementation"]: row for row in new_rows}
+            print(
+                f"bs={batch_size} prompt={prompt_len}: "
+                f"baseline={by_impl['baseline_no_kv']['median_ms']} ms, "
+                f"contiguous={by_impl['contiguous_kv']['median_ms']} ms, "
+                f"paged={by_impl['paged_attention']['median_ms']} ms, "
+                f"paged_error={by_impl['paged_attention']['output_max_abs_error']:.3e}, "
+                f"timed_h2d_kv=0 bytes"
+            )
 
     output_path = Path(args.output_dir) / args.output_csv
-    write_rows(output_path, rows)
+    _write_csv(output_path, rows)
     print(f"Wrote {output_path}")
 
 

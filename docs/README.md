@@ -90,14 +90,6 @@ Parallel sampling generates multiple outputs from the same prompt. A naive clone
 
 Beam-style workloads have the same sharing opportunity: beams share the prompt and may share a generated trunk before they diverge. The naive clone baseline repeats KV for each beam, while paged fork shares prompt/trunk blocks and stores only branch tips. Peak savings are about `33%` to `79%`, and post-prune live blocks can be lower still. This is an allocator simulation rather than a complete quality-aware beam-search scheduler, but it demonstrates the memory effect clearly.
 
-### GPU-Resident KV Microbenchmark
-
-![GPU-only KV cache microbenchmark](../benchmarks/results_gpu_kv/gpu_kv_decode_attention.png)
-
-This focused benchmark is produced by `project/run_gpu_kv_benchmark.py` and `project/plot_gpu_kv_results.py`. It uploads K/V to the CUDA runtime once, then times decode attention calls that read device-resident K/V. The stateless comparison path recopies the full host KV cache on every call. The GPU-resident runtime measures about `0.28-0.60 ms` per decode-attention call versus `1.00-2.33 ms` for stateless full-copy, giving `2.66x-3.98x` speedup in this grid.
-
-The caveat matters: this is an attention-runtime microbenchmark, not a full serving benchmark. The full MiniTorch model path still uses a CPU NumPy `BlockManager` as the authoritative KV cache and synchronizes touched slots/blocks to the CUDA runtime. The ctypes wrapper also still includes query host-to-device and output device-to-host copies, so the plotted latency is wrapper-level attention-call time, not pure kernel time.
-
 ## vLLM/PagedAttention vs This Project
 
 This project implements the same core abstraction as the PagedAttention paper: fixed-size physical KV blocks, per-sequence block tables, logical-to-physical translation, and reference-counted sharing. The engineering target is very different, though. vLLM is a production serving system; this project is a readable MiniTorch implementation that validates the mechanism.
@@ -105,12 +97,12 @@ This project implements the same core abstraction as the PagedAttention paper: f
 | Dimension | vLLM / PagedAttention production serving | This MiniTorch project |
 | --- | --- | --- |
 | Goal | Serve real LLM requests with high throughput and controlled latency. | Rebuild the mechanism in a teaching framework with inspectable code and focused benchmarks. |
-| Model and inputs | Real pretrained LLMs, tokenizers, and online serving workloads. | Synthetic token IDs and randomly initialized MiniTorch decoder models. |
+| Model and inputs | Real pretrained LLMs, tokenizers, and online serving workloads. | Synthetic MiniTorch runs plus a full-model MiniTorch GPT-2 benchmark using pretrained weights and real WikiText tokens. |
 | Scheduler | Continuous batching, admission control, request lifecycle management, and memory pressure handling. | Mostly static benchmark loops; no full online scheduler, queueing model, or preemption. |
-| KV source of truth | GPU-resident KV cache is the serving-critical state integrated with scheduler and kernels. | Full-model path keeps CPU NumPy `BlockManager` as authoritative KV and mirrors touched data into CUDA runtime. |
+| KV source of truth | GPU-resident KV cache is the serving-critical state integrated with scheduler and kernels. | The default teaching path still supports CPU NumPy K/V, while the GPT-2 benchmark uses a host-cache-free `BlockManager` and GPU-resident contiguous/paged K/V. |
 | Memory layout | GPU-optimized layouts for coalesced/vectorized access, precision choices, and large contexts. | Clear `(num_blocks, block_size, n_head, head_dim)` layout for teaching and correctness. |
 | Attention kernels | Production-optimized paged attention kernels with batching, long-context strategies, and hardware-aware implementation. | A readable V1-style CUDA decode kernel without vLLM-level template specialization, online softmax, or V2 long-context decomposition. |
-| Host/device transfers | End-to-end execution avoids unnecessary host synchronization. | Some wrapper paths still copy query/output each call and synchronize CPU/GPU cache state. |
+| Host/device transfers | End-to-end execution avoids unnecessary host synchronization. | The GPT-2 benchmark avoids CPU/GPU K/V transfers; some older reference/wrapper paths still copy query/output or metadata for clarity. |
 | Prefix and branch sharing | Integrated with real serving policies for prefix reuse, parallel sampling, and beam-like workloads. | Full-block prefix cache plus `fork_sequence`/`clone_sequence` simulations; no complete quality-aware beam scheduler. |
 | Precision and scale | FP16/BF16-style inference at large model scale. | Mostly `float32`, smaller model sizes, correctness-first measurements. |
 | Baselines and metrics | End-to-end serving throughput, latency, and capacity against production baselines. | Allocator efficiency, fixed-budget capacity, prefix reuse, branch memory, and microbenchmark latency. |

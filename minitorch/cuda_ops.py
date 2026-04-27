@@ -1,6 +1,7 @@
 from typing import Callable, Optional
 
 import numba
+import numpy as np
 from numba import cuda
 
 from .tensor import Tensor
@@ -103,6 +104,15 @@ class CudaOps(TensorOps):
         assert a.shape[-1] == b.shape[-2]
         out = a.zeros(tuple(ls))
 
+        more_3d = False
+        if len(out.shape) > 3:
+            more_3d = True
+            out = out.view(int(np.prod(out.shape[:-2])), out.shape[-2], out.shape[-1])
+        if len(a.shape) > 3:
+            a = a.contiguous().view(int(np.prod(a.shape[:-2])), a.shape[-2], a.shape[-1])
+        if len(b.shape) > 3:
+            b = b.contiguous().view(int(np.prod(b.shape[:-2])), b.shape[-2], b.shape[-1])
+
         # One block per batch, extra rows, extra col
         blockspergrid = (
             (out.shape[1] + (THREADS_PER_BLOCK - 1)) // THREADS_PER_BLOCK,
@@ -118,7 +128,25 @@ class CudaOps(TensorOps):
         # Undo 3d if we added it.
         if both_2d:
             out = out.view(out.shape[1], out.shape[2])
+        if more_3d:
+            out = out.view(*ls)
         return out
+
+    @staticmethod
+    def attn_softmax_fw(inp: Tensor, mask: Tensor):
+        raise NotImplementedError("CudaOps does not provide the fused attention softmax")
+
+    @staticmethod
+    def attn_softmax_bw(out_grad: Tensor, soft_inp: Tensor):
+        raise NotImplementedError("CudaOps does not provide the fused attention softmax backward")
+
+    @staticmethod
+    def layernorm_fw(inp: Tensor, gamma: Tensor, beta: Tensor):
+        raise NotImplementedError("CudaOps does not provide the fused layernorm")
+
+    @staticmethod
+    def layernorm_bw(out_grad: Tensor, inp: Tensor, gamma: Tensor, beta: Tensor, var: Tensor, mean: Tensor):
+        raise NotImplementedError("CudaOps does not provide the fused layernorm backward")
 
 
 # Implement

@@ -10,6 +10,7 @@ from __future__ import annotations
 import ctypes
 import os
 import numpy as np
+import numba
 from typing import Dict, List, Optional, Tuple
 
 from .module import Module, Parameter
@@ -216,6 +217,14 @@ class PagedAttentionKernel:
             np.ctypeslib.ndpointer(dtype=datatype, flags="C_CONTIGUOUS"),
         ]
         lib.paged_attention_runtime_update_slot.restype = None
+        lib.paged_attention_runtime_update_slot_from_device.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_void_p,
+            ctypes.c_void_p,
+        ]
+        lib.paged_attention_runtime_update_slot_from_device.restype = None
         lib.paged_attention_runtime_upload_block.argtypes = [
             ctypes.c_void_p,
             ctypes.c_int,
@@ -259,6 +268,18 @@ class PagedAttentionKernel:
             ctypes.c_int,
         ]
         lib.contiguous_attention_forward_device.restype = None
+        lib.contiguous_kv_update_slot_from_device.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_void_p,
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_void_p,
+            ctypes.c_void_p,
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_int,
+        ]
+        lib.contiguous_kv_update_slot_from_device.restype = None
         lib.paged_attention_runtime_prefill_with_prefix_forward.argtypes = [
             ctypes.c_void_p,
             np.ctypeslib.ndpointer(dtype=datatype, flags="C_CONTIGUOUS"),
@@ -358,6 +379,25 @@ class PagedAttentionKernel:
             value_np,
         )
 
+    def update_slot_from_device(
+        self,
+        block_id: int,
+        slot_idx: int,
+        key_ptr: int,
+        value_ptr: int,
+    ) -> None:
+        lib = self._load_library()
+        if self._runtime is None:
+            raise ValueError("Runtime not initialized")
+
+        lib.paged_attention_runtime_update_slot_from_device(
+            self._runtime,
+            int(block_id),
+            int(slot_idx),
+            ctypes.c_void_p(int(key_ptr)),
+            ctypes.c_void_p(int(value_ptr)),
+        )
+
     def upload_block(self, block_id: int, key_block, value_block) -> None:
         lib = self._load_library()
         if self._runtime is None:
@@ -439,6 +479,31 @@ class PagedAttentionKernel:
             int(n_head),
             int(head_dim),
             int(max_context_len),
+        )
+
+    def contiguous_update_slot_from_device(
+        self,
+        key_cache_ptr: int,
+        value_cache_ptr: int,
+        batch_idx: int,
+        slot_idx: int,
+        key_ptr: int,
+        value_ptr: int,
+        max_context_len: int,
+        n_head: int,
+        head_dim: int,
+    ) -> None:
+        lib = self._load_library()
+        lib.contiguous_kv_update_slot_from_device(
+            ctypes.c_void_p(int(key_cache_ptr)),
+            ctypes.c_void_p(int(value_cache_ptr)),
+            int(batch_idx),
+            int(slot_idx),
+            ctypes.c_void_p(int(key_ptr)),
+            ctypes.c_void_p(int(value_ptr)),
+            int(max_context_len),
+            int(n_head),
+            int(head_dim),
         )
 
     def close(self) -> None:
@@ -568,6 +633,7 @@ class PagedMultiHeadAttention(Module):
         decode_backend: str = "ref",
         compare_to_ref: bool = False,
         compare_tolerance: float = 1e-4,
+        gpu_resident_kv: bool = False,
     ):
         super().__init__()
         self.n_embd = n_embd
@@ -579,6 +645,9 @@ class PagedMultiHeadAttention(Module):
         if decode_backend not in {"ref", "cuda"}:
             raise ValueError("decode_backend must be 'ref' or 'cuda'")
         self.decode_backend = decode_backend
+        if gpu_resident_kv and decode_backend != "cuda":
+            raise ValueError("gpu_resident_kv requires decode_backend='cuda'")
+        self.gpu_resident_kv = bool(gpu_resident_kv)
         self.compare_to_ref = compare_to_ref
         self.compare_tolerance = compare_tolerance
         self.last_decode_compare: Optional[Dict[str, float]] = None
@@ -590,6 +659,26 @@ class PagedMultiHeadAttention(Module):
         self._kernel: Optional[PagedAttentionKernel] = None
         self._runtime_block_manager_id: Optional[int] = None
         self._runtime_valid_block_ids: set[int] = set()
+
+    @staticmethod
+    def _device_ptr(t: Tensor) -> int:
+        storage = t._tensor._storage
+        if not numba.cuda.is_cuda_array(storage):
+            raise RuntimeError(
+                "GPU-resident KV requires MiniTorch tensors backed by CUDA device storage"
+            )
+        return int(storage.__cuda_array_interface__["data"][0])
+
+    def _empty_like_attention_output(self, batch_size: int, backend: TensorBackend) -> Tensor:
+        storage = numba.cuda.device_array(
+            batch_size * self.n_head * self.head_dim,
+            dtype=datatype,
+        )
+        return Tensor.make(
+            storage,
+            (batch_size, self.n_head, self.head_dim),
+            backend=backend,
+        )
 
     def _ensure_kernel_runtime(
         self,
@@ -641,6 +730,10 @@ class PagedMultiHeadAttention(Module):
     ) -> None:
         if self.decode_backend != "cuda":
             return
+        if self.gpu_resident_kv:
+            raise RuntimeError(
+                "GPU-resident KV cache cannot be reconstructed from host BlockManager storage"
+            )
         if self._kernel is None:
             raise ValueError("CUDA runtime must be initialized before uploading blocks")
 
@@ -675,6 +768,10 @@ class PagedMultiHeadAttention(Module):
         )
         current_manager_id = id(block_manager)
         if self._runtime_block_manager_id != current_manager_id:
+            if self.gpu_resident_kv and any(int(token_count) > 0 for token_count in token_counts):
+                raise RuntimeError(
+                    "GPU-resident KV runtime lost its device cache; rerun prefill before decode"
+                )
             self._runtime_valid_block_ids.clear()
             self._sync_runtime_blocks_for_sequences(block_manager, seq_ids, token_counts)
             self._runtime_block_manager_id = current_manager_id
@@ -776,6 +873,48 @@ class PagedMultiHeadAttention(Module):
             self._upload_runtime_blocks(block_manager, list(touched_block_ids))
             self._runtime_block_manager_id = id(block_manager)
 
+    def _write_kv_batch_to_device_cache(
+        self,
+        block_manager: BlockManager,
+        seq_ids: List[int],
+        token_start: int,
+        key_values: Tensor,
+        value_values: Tensor,
+    ) -> None:
+        if not self.gpu_resident_kv:
+            raise RuntimeError("Device KV writes require gpu_resident_kv=True")
+        if key_values.shape != value_values.shape:
+            raise ValueError("key_values and value_values must have matching shapes")
+        if key_values.shape[0] != len(seq_ids):
+            raise ValueError("Batch dimension must match seq_ids length")
+        if key_values.shape[2:] != (self.n_head, self.head_dim):
+            raise ValueError(
+                f"Expected K/V shape (batch, tokens, {self.n_head}, {self.head_dim})"
+            )
+
+        self._ensure_kernel_runtime(block_manager, seq_ids)
+        key_ptr = self._device_ptr(key_values)
+        value_ptr = self._device_ptr(value_values)
+        row_elems = self.n_head * self.head_dim
+        itemsize = np.dtype(datatype).itemsize
+
+        touched_block_ids = set()
+        for batch_idx, seq_id in enumerate(seq_ids):
+            for local_idx in range(key_values.shape[1]):
+                token_index = token_start + local_idx
+                block_id, slot_idx = block_manager.get_physical_location(seq_id, token_index)
+                offset = (batch_idx * key_values.shape[1] + local_idx) * row_elems * itemsize
+                self._kernel.update_slot_from_device(
+                    block_id,
+                    slot_idx,
+                    key_ptr + offset,
+                    value_ptr + offset,
+                )
+                touched_block_ids.add(block_id)
+
+        self._runtime_valid_block_ids.update(touched_block_ids)
+        self._runtime_block_manager_id = id(block_manager)
+
     def _decode_attention_ref(
         self,
         q: Tensor,
@@ -809,15 +948,33 @@ class PagedMultiHeadAttention(Module):
         context_lens = [
             block_manager.get_context_len(seq_id) for seq_id in seq_ids
         ]
-        self._ensure_runtime_synced_for_sequences(
-            block_manager,
-            seq_ids,
-            context_lens,
-        )
+        if self.gpu_resident_kv:
+            self._ensure_kernel_runtime(block_manager, seq_ids)
+            if self._runtime_block_manager_id != id(block_manager):
+                raise RuntimeError(
+                    "GPU-resident KV runtime has no cache for this BlockManager; run prefill first"
+                )
+        else:
+            self._ensure_runtime_synced_for_sequences(
+                block_manager,
+                seq_ids,
+                context_lens,
+            )
         block_tables = block_manager.get_block_table_array(seq_ids)
         context_lens_np = np.array(context_lens, dtype=np.int32)
         max_context_len = int(context_lens_np.max()) if len(context_lens_np) > 0 else 0
         self._kernel.update_metadata(block_tables, context_lens_np)
+        if self.gpu_resident_kv:
+            batch_size = len(seq_ids)
+            q_device = q.contiguous().view(batch_size, self.n_head, self.head_dim)
+            output = self._empty_like_attention_output(batch_size, q.backend)
+            self._kernel.forward_device(
+                self._device_ptr(q_device),
+                self._device_ptr(output),
+                batch_size,
+                max_context_len,
+            )
+            return output.view(batch_size, self.n_head, 1, self.head_dim)
         return self._kernel.forward(
             q,
             max_context_len=max_context_len,
@@ -859,6 +1016,10 @@ class PagedMultiHeadAttention(Module):
             raise ValueError("Batch size must match number of seq_ids")
         if work_len <= 0:
             raise ValueError("forward_prefill_with_prefix_batch expects at least one token")
+        if self.gpu_resident_kv:
+            raise NotImplementedError(
+                "Prefix-cache prefill is not implemented for GPU-resident KV mode"
+            )
 
         flat_x = x.contiguous().view(batch_size * work_len, self.n_embd)
         q = self.q_proj(flat_x).view(batch_size, work_len, self.n_head, self.head_dim)
@@ -989,16 +1150,27 @@ class PagedMultiHeadAttention(Module):
         )
         output = self.out_proj(output).view(batch_size, seq_len, self.n_embd)
 
-        k_cache_values = k.permute(0, 2, 1, 3).to_numpy()
-        v_cache_values = v.permute(0, 2, 1, 3).to_numpy()
+        if self.gpu_resident_kv:
+            k_cache_values = k.permute(0, 2, 1, 3).contiguous()
+            v_cache_values = v.permute(0, 2, 1, 3).contiguous()
+            self._write_kv_batch_to_device_cache(
+                block_manager,
+                seq_ids,
+                0,
+                k_cache_values,
+                v_cache_values,
+            )
+        else:
+            k_cache_values = k.permute(0, 2, 1, 3).to_numpy()
+            v_cache_values = v.permute(0, 2, 1, 3).to_numpy()
 
-        self._write_kv_batch_to_cache(
-            block_manager,
-            seq_ids,
-            0,
-            k_cache_values,
-            v_cache_values,
-        )
+            self._write_kv_batch_to_cache(
+                block_manager,
+                seq_ids,
+                0,
+                k_cache_values,
+                v_cache_values,
+            )
 
         return output
 
@@ -1033,10 +1205,15 @@ class PagedMultiHeadAttention(Module):
         k = k.permute(0, 2, 1, 3)
         v = v.permute(0, 2, 1, 3)
 
-        k_new = k.permute(0, 2, 1, 3).to_numpy()[:, 0, :, :]
-        v_new = v.permute(0, 2, 1, 3).to_numpy()[:, 0, :, :]
+        if self.gpu_resident_kv:
+            k_new_device = k.permute(0, 2, 1, 3).contiguous()
+            v_new_device = v.permute(0, 2, 1, 3).contiguous()
+            self._ensure_kernel_runtime(block_manager, seq_ids)
+        else:
+            k_new = k.permute(0, 2, 1, 3).to_numpy()[:, 0, :, :]
+            v_new = v.permute(0, 2, 1, 3).to_numpy()[:, 0, :, :]
 
-        if self.decode_backend == "cuda":
+        if self.decode_backend == "cuda" and not self.gpu_resident_kv:
             prior_context_lens = [
                 block_manager.get_context_len(seq_id) - 1 for seq_id in seq_ids
             ]
@@ -1047,29 +1224,41 @@ class PagedMultiHeadAttention(Module):
             )
 
         for batch_idx, seq_id in enumerate(seq_ids):
-            block_table = block_manager.block_tables[seq_id]
             token_index = block_manager.get_context_len(seq_id) - 1
             block_id, slot_idx = block_manager.get_physical_location(seq_id, token_index)
-            block_manager.write_kv_slot(
-                block_id,
-                slot_idx,
-                k_new[batch_idx],
-                v_new[batch_idx],
-                layer=self.layer_id,
-            )
-            if self.decode_backend == "cuda":
-                self._kernel.update_slot(
+            if self.gpu_resident_kv:
+                row_elems = self.n_head * self.head_dim
+                itemsize = np.dtype(datatype).itemsize
+                offset = batch_idx * row_elems * itemsize
+                self._kernel.update_slot_from_device(
+                    block_id,
+                    slot_idx,
+                    self._device_ptr(k_new_device) + offset,
+                    self._device_ptr(v_new_device) + offset,
+                )
+                self._runtime_valid_block_ids.add(block_id)
+                self._runtime_block_manager_id = id(block_manager)
+            else:
+                block_manager.write_kv_slot(
                     block_id,
                     slot_idx,
                     k_new[batch_idx],
                     v_new[batch_idx],
+                    layer=self.layer_id,
                 )
-                self._runtime_valid_block_ids.add(block_id)
-                self._runtime_block_manager_id = id(block_manager)
+                if self.decode_backend == "cuda":
+                    self._kernel.update_slot(
+                        block_id,
+                        slot_idx,
+                        k_new[batch_idx],
+                        v_new[batch_idx],
+                    )
+                    self._runtime_valid_block_ids.add(block_id)
+                    self._runtime_block_manager_id = id(block_manager)
 
         if self.decode_backend == "cuda":
             output = self._decode_attention_kernel(q, block_manager, seq_ids)
-            if self.compare_to_ref:
+            if self.compare_to_ref and not self.gpu_resident_kv:
                 ref_output = self._decode_attention_ref(q, block_manager, seq_ids)
                 output_np = output.to_numpy()
                 ref_np = ref_output.to_numpy()

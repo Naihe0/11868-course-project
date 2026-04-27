@@ -724,6 +724,35 @@ void paged_attention_runtime_update_slot(
     ));
 }
 
+void paged_attention_runtime_update_slot_from_device(
+    void* handle,
+    int block_id,
+    int slot_idx,
+    const float* key_device,
+    const float* value_device
+) {
+    if (handle == nullptr) return;
+    CUDA_CHECK(cudaSetDevice(0));
+
+    PagedAttentionRuntime* runtime = static_cast<PagedAttentionRuntime*>(handle);
+    size_t slot_elems = (size_t)runtime->n_head * runtime->head_dim;
+    size_t slot_offset = ((size_t)block_id * runtime->block_size + slot_idx) * slot_elems;
+    size_t slot_bytes = slot_elems * sizeof(float);
+
+    CUDA_CHECK(cudaMemcpy(
+        runtime->d_key_cache + slot_offset,
+        key_device,
+        slot_bytes,
+        cudaMemcpyDeviceToDevice
+    ));
+    CUDA_CHECK(cudaMemcpy(
+        runtime->d_value_cache + slot_offset,
+        value_device,
+        slot_bytes,
+        cudaMemcpyDeviceToDevice
+    ));
+}
+
 void paged_attention_runtime_upload_block(
     void* handle,
     int block_id,
@@ -953,6 +982,37 @@ void contiguous_attention_forward_device(
     );
     CUDA_CHECK(cudaGetLastError());
     CUDA_CHECK(cudaDeviceSynchronize());
+}
+
+void contiguous_kv_update_slot_from_device(
+    float* key_cache_device,
+    float* value_cache_device,
+    int batch_idx,
+    int slot_idx,
+    const float* key_device,
+    const float* value_device,
+    int max_context_len,
+    int n_head,
+    int head_dim
+) {
+    CUDA_CHECK(cudaSetDevice(0));
+
+    size_t slot_elems = (size_t)n_head * head_dim;
+    size_t slot_offset = ((size_t)batch_idx * max_context_len + slot_idx) * slot_elems;
+    size_t slot_bytes = slot_elems * sizeof(float);
+
+    CUDA_CHECK(cudaMemcpy(
+        key_cache_device + slot_offset,
+        key_device,
+        slot_bytes,
+        cudaMemcpyDeviceToDevice
+    ));
+    CUDA_CHECK(cudaMemcpy(
+        value_cache_device + slot_offset,
+        value_device,
+        slot_bytes,
+        cudaMemcpyDeviceToDevice
+    ));
 }
 void paged_attention_runtime_prefill_with_prefix_forward(
     void* handle,

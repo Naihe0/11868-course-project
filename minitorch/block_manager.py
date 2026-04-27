@@ -109,6 +109,7 @@ class BlockManager:
         head_dim: int = 64,
         cache_dtype: np.dtype = CACHE_DTYPE,
         num_layers: int = None,
+        allocate_host_cache: bool = True,
     ):
         if num_layers is None:
             raise ValueError("BlockManager requires an explicit num_layers")
@@ -117,6 +118,7 @@ class BlockManager:
         self.n_head = n_head
         self.head_dim = head_dim
         self.cache_dtype = cache_dtype
+        self.allocate_host_cache = bool(allocate_host_cache)
 
         # Physical block metadata pool.
         self.blocks: Dict[int, KVBlock] = {
@@ -138,8 +140,12 @@ class BlockManager:
         # Global K/V caches indexed by physical block id.
         cache_shape = (num_blocks, block_size, n_head, head_dim)
         self.num_layers = num_layers
-        self.key_cache = [np.zeros(cache_shape, dtype=cache_dtype) for _ in range(num_layers)]
-        self.value_cache = [np.zeros(cache_shape, dtype=cache_dtype) for _ in range(num_layers)]
+        if self.allocate_host_cache:
+            self.key_cache = [np.zeros(cache_shape, dtype=cache_dtype) for _ in range(num_layers)]
+            self.value_cache = [np.zeros(cache_shape, dtype=cache_dtype) for _ in range(num_layers)]
+        else:
+            self.key_cache = None
+            self.value_cache = None
 
     # ----- Capacity queries ------------------------------------------------
 
@@ -148,8 +154,12 @@ class BlockManager:
         """Return the number of unallocated physical blocks."""
         return len(self.free_block_ids)
     def get_key_cache(self, layer: int) -> np.ndarray:
+        if self.key_cache is None:
+            raise RuntimeError("This BlockManager was created without host KV cache storage")
         return self.key_cache[layer]
     def get_value_cache(self, layer: int) -> np.ndarray:
+        if self.value_cache is None:
+            raise RuntimeError("This BlockManager was created without host KV cache storage")
         return self.value_cache[layer]
     @property
     def num_used_blocks(self) -> int:
@@ -180,9 +190,10 @@ class BlockManager:
         block = self.blocks[block_id]
         block.ref_count = 1
         block.num_filled = 0
-        for layer in range(self.num_layers):
-            self.key_cache[layer][block_id].fill(0)
-            self.value_cache[layer][block_id].fill(0)
+        if self.key_cache is not None:
+            for layer in range(self.num_layers):
+                self.key_cache[layer][block_id].fill(0)
+                self.value_cache[layer][block_id].fill(0)
         return block
 
     def allocate_blocks_for_sequence(self, seq_id: int, num_tokens: int) -> BlockTable:
@@ -221,9 +232,10 @@ class BlockManager:
             for block_id in allocated_block_ids:
                 self.blocks[block_id].ref_count = 0
                 self.blocks[block_id].num_filled = 0
-                for layer_id in range(self.num_layers):
-                    self.key_cache[layer_id][block_id].fill(0)
-                    self.value_cache[layer_id][block_id].fill(0)
+                if self.key_cache is not None:
+                    for layer_id in range(self.num_layers):
+                        self.key_cache[layer_id][block_id].fill(0)
+                        self.value_cache[layer_id][block_id].fill(0)
                 self.free_block_ids.append(block_id)
             self.free_block_ids.sort()
             raise
@@ -369,9 +381,10 @@ class BlockManager:
             for block_id in allocated_suffix_ids:
                 self.blocks[block_id].ref_count = 0
                 self.blocks[block_id].num_filled = 0
-                for layer_id in range(self.num_layers):
-                    self.key_cache[layer_id][block_id].fill(0)
-                    self.value_cache[layer_id][block_id].fill(0)
+                if self.key_cache is not None:
+                    for layer_id in range(self.num_layers):
+                        self.key_cache[layer_id][block_id].fill(0)
+                        self.value_cache[layer_id][block_id].fill(0)
                 self.free_block_ids.append(block_id)
             self.free_block_ids.sort()
             raise
@@ -455,9 +468,10 @@ class BlockManager:
         block.ref_count = 0
         self.cached_block_ids.discard(block_id)
 
-        for layer_id in range(self.num_layers):
-            self.key_cache[layer_id][block_id].fill(0)
-            self.value_cache[layer_id][block_id].fill(0)
+        if self.key_cache is not None:
+            for layer_id in range(self.num_layers):
+                self.key_cache[layer_id][block_id].fill(0)
+                self.value_cache[layer_id][block_id].fill(0)
 
         if block_id not in self.free_block_ids:
             self.free_block_ids.append(block_id)
@@ -512,9 +526,10 @@ class BlockManager:
                     self.cached_free_lru.move_to_end(block_id, last=True)
                 else:
                     self.blocks[block_id].num_filled = 0
-                    for layer_id in range(self.num_layers):
-                        self.key_cache[layer_id][block_id].fill(0)
-                        self.value_cache[layer_id][block_id].fill(0)
+                    if self.key_cache is not None:
+                        for layer_id in range(self.num_layers):
+                            self.key_cache[layer_id][block_id].fill(0)
+                            self.value_cache[layer_id][block_id].fill(0)
                     self.free_block_ids.append(block_id)
         del self.block_tables[seq_id]
         del self.context_lens[seq_id]
@@ -542,6 +557,8 @@ class BlockManager:
         layer: int = 0,
     ) -> None:
         """Write one token's K/V vectors into the global cache."""
+        if self.key_cache is None:
+            raise RuntimeError("This BlockManager has no host KV cache; write to the GPU runtime instead")
         if key.shape != (self.n_head, self.head_dim):
             raise ValueError(f"Key shape must be ({self.n_head}, {self.head_dim})")
         if value.shape != (self.n_head, self.head_dim):

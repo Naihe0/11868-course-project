@@ -53,7 +53,7 @@ Outputs are written to `benchmarks/results/` by default.
 
 ## GPT-2 Pretrained Benchmark Path
 
-`project/run_gpt2_paged_benchmark.py` is the first real-model benchmark path. It loads a HuggingFace GPT-2-family checkpoint into `PagedDecoderLM`, tokenizes real text prompts, runs MiniTorch prefill/decode through the paged KV cache, and writes latency plus KV-cache accounting to CSV.
+`project/run_gpt2_paged_benchmark.py` loads a HuggingFace GPT-2-family checkpoint, copies the pretrained weights into the local MiniTorch `PagedDecoderLM`, tokenizes real text prompts from WikiText by default, and runs the full MiniTorch model for all three paths. Timed iterations compare no-cache full-context recompute, contiguous GPU KV decode, and the project's GPU-resident PagedAttention runtime. The contiguous and paged KV caches are device-owned and updated with device-to-device copies; timed rows report zero host-to-device K/V bytes.
 
 Install the optional dependencies first:
 
@@ -61,17 +61,18 @@ Install the optional dependencies first:
 pip install -r requirements.gpt2.txt
 ```
 
-Fast loader and shape-mapping smoke run:
+Fast loader and shape smoke run:
 
 ```bash
 python project/run_gpt2_paged_benchmark.py \
   --model-name sshleifer/tiny-gpt2 \
-  --max-prompts 2 \
-  --max-prompt-tokens 16 \
-  --max-new-tokens 4
+  --batch-sizes 1 \
+  --seq-lengths 4 \
+  --warmup-iters 0 \
+  --timed-iters 1
 ```
 
-Real GPT-2 run on WikiText:
+Real GPT-2 run on WikiText. The MiniTorch CUDA backend is intentionally simple, so start small and scale sequence length only if you have time:
 
 ```bash
 python project/run_gpt2_paged_benchmark.py \
@@ -79,20 +80,25 @@ python project/run_gpt2_paged_benchmark.py \
   --dataset-name wikitext \
   --dataset-config wikitext-2-raw-v1 \
   --dataset-split test \
-  --max-prompts 8 \
-  --max-prompt-tokens 64 \
-  --max-new-tokens 16
+  --batch-sizes 1 \
+  --seq-lengths 1 \
+  --warmup-iters 0 \
+  --timed-iters 1
 ```
 
 Output defaults to:
 
 ```text
-benchmarks/results_gpt2/gpt2_paged_benchmark.csv
+benchmarks/results_gpt2/gpt2_gpu_kv_benchmark.csv
 ```
 
-This path is intentionally batch-size-1 for now because the MiniTorch decoder does not yet carry a padding attention mask. It is useful for validating pretrained GPT-2 weight mapping and real tokenized prompt behavior before adding batched scheduling.
+Plot the comparison:
 
-Start with `sshleifer/tiny-gpt2` when checking code changes. Full `gpt2` is supported by the weight loader, but CPU runs can be slow because the educational MiniTorch embedding path materializes one-hot vectors and the LM head materializes full-vocabulary logits.
+```bash
+python project/plot_gpt2_benchmark.py
+```
+
+The plots show full-model decode latency, query-token throughput, and KV memory for the three compared paths. Start with `sshleifer/tiny-gpt2` when checking code changes; use full `gpt2` for the final measurement.
 
 ## General Benchmark Run
 

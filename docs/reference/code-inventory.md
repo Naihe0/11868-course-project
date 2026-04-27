@@ -87,9 +87,11 @@ These files are inherited MiniTorch framework pieces. They matter because the Pa
 | `project/run_inference.py` | `parse_args`, `_sample`, `_reference_last_logits`, `main` | CLI for synthetic generation using `PagedDecoderLM` and `BlockManager`. Supports CPU/CUDA tensor backends, reference/CUDA decode backends, CUDA-reference comparison, and full recomputation checks. |
 | `project/run_benchmark.py` | `benchmark_throughput`, `benchmark_baseline_throughput`, `benchmark_prefix_cache_prefill`, `benchmark_fragmentation`, `benchmark_max_batch_size`, `check_correctness`, `main` | General benchmark suite producing throughput, latency, fragmentation, max-batch, correctness, optional baseline, and optional prefix-cache CSV outputs. |
 | `project/run_rigorous_benchmark.py` | `run_memory_breakdown`, `run_capacity_curve`, `run_decode_speed`, `run_prefix_prefill`, `run_parallel_sampling_memory`, `run_beam_search_memory`, `main` | Cleaner six-experiment benchmark used by poster/report figures. Includes memory breakdown, capacity, decode speed, prefix prefill, parallel sampling memory, and beam-search memory. |
+| `project/run_gpt2_paged_benchmark.py` | `main`, `_make_model_from_hf`, `_benchmark_one`, `NoKVDecoder`, `GpuContiguousKVDecoder` | Loads pretrained GPT-2 weights into the MiniTorch model, tokenizes real WikiText prompts, and compares full-model no-cache recompute, contiguous GPU KV decode, and GPU-resident PagedAttention. |
 | `project/contiguous_kv_baseline.py` | `ContiguousKVDecoderLM` | HuggingFace-style contiguous KV baseline that shares model weights with `PagedDecoderLM` for fair benchmark comparisons. |
 | `project/plot.py` | `plot_throughput_vs_batch`, `plot_latency_vs_seqlen`, `plot_speedup_vs_seqlen`, `plot_fragmentation_vs_blocksize`, `plot_kv_memory_vs_contiguous` | Plots CSV output from `run_benchmark.py`. |
 | `project/plot_rigorous_figures.py` | `plot_fig1_memory_breakdown` through `plot_fig6_beam_search`, `main` | Produces report/poster-ready figures from rigorous benchmark CSVs. |
+| `project/plot_gpt2_benchmark.py` | `plot_latency`, `plot_throughput`, `plot_kv_memory`, `main` | Plots the GPT-2 benchmark comparison CSV into latency, throughput, and KV-memory figures. |
 
 ## Tests
 

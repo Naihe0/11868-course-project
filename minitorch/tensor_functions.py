@@ -544,6 +544,7 @@ def tensor_from_numpy(
         backend=backend
     )
 
+    res._type_(backend)
     res.requires_grad_(requires_grad)
     
     return res
@@ -554,7 +555,7 @@ def zeros_tensor_from_numpy(shape, backend: TensorBackend = SimpleBackend):
     Any other usage could result in undefined behavior.
     """
     zs = np.zeros(shape).astype(datatype)
-    return minitorch.Tensor(
+    res = minitorch.Tensor(
         v = minitorch.TensorData(
             zs.flatten(), # Will create a COPY of the numpy array
             shape, 
@@ -562,6 +563,8 @@ def zeros_tensor_from_numpy(shape, backend: TensorBackend = SimpleBackend):
         ),
         backend=backend
     )
+    res._type_(backend)
+    return res
 
 
 def ones_tensor_from_numpy(shape, backend: TensorBackend = SimpleBackend):
@@ -569,7 +572,7 @@ def ones_tensor_from_numpy(shape, backend: TensorBackend = SimpleBackend):
     Any other usage could result in undefined behavior.
     """
     zs = np.ones(shape).astype(datatype)
-    return minitorch.Tensor(
+    res = minitorch.Tensor(
         v = minitorch.TensorData(
             zs.flatten(), # Will create a COPY of the numpy array
             shape, 
@@ -577,6 +580,8 @@ def ones_tensor_from_numpy(shape, backend: TensorBackend = SimpleBackend):
         ),
         backend=backend
     )
+    res._type_(backend)
+    return res
 
 # Gradient check for tensors
 
