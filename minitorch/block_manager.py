@@ -136,6 +136,7 @@ class BlockManager:
         self.cached_block_ids: set[int] = set()
         self.cached_free_lru: "OrderedDict[int, None]" = OrderedDict()
         self.seq_prefix_cache_info: Dict[int, PrefixCacheMatch] = {}
+        self.peak_active_blocks = 0
 
         # Global K/V caches indexed by physical block id.
         cache_shape = (num_blocks, block_size, n_head, head_dim)
@@ -165,6 +166,16 @@ class BlockManager:
     def num_used_blocks(self) -> int:
         return self.num_blocks - self.num_free_blocks
 
+    @property
+    def num_active_blocks(self) -> int:
+        return sum(1 for block in self.blocks.values() if block.ref_count > 0)
+
+    def reset_peak_usage(self) -> None:
+        self.peak_active_blocks = self.num_active_blocks
+
+    def _update_peak_usage(self) -> None:
+        self.peak_active_blocks = max(self.peak_active_blocks, self.num_active_blocks)
+
     def can_allocate(self, num_required: int = 1) -> bool:
         """Check whether `num_required` more blocks can be allocated."""
         return (self.num_free_blocks + len(self.cached_free_lru)) >= num_required
@@ -190,10 +201,13 @@ class BlockManager:
         block = self.blocks[block_id]
         block.ref_count = 1
         block.num_filled = 0
+        block.block_hash = None
+        block.is_prefix_cached = False
         if self.key_cache is not None:
             for layer in range(self.num_layers):
                 self.key_cache[layer][block_id].fill(0)
                 self.value_cache[layer][block_id].fill(0)
+        self._update_peak_usage()
         return block
 
     def allocate_blocks_for_sequence(self, seq_id: int, num_tokens: int) -> BlockTable:
@@ -242,6 +256,7 @@ class BlockManager:
 
         self.context_lens[seq_id] = num_tokens
         self.block_tables[seq_id] = block_table
+        self._update_peak_usage()
         return block_table
 
     # ----- Prefix-cache helpers -------------------------------------------
@@ -396,6 +411,79 @@ class BlockManager:
             cached_token_count=prefix_token_count,
         )
         return block_table
+
+    def fork_sequence(self, parent_seq_id: int, child_seq_id: int) -> BlockTable:
+        """Create a child sequence that shares the parent's current blocks.
+
+        This is the live-sequence counterpart to prefix-cache reuse: the child
+        directly copies the parent's logical block table and increments
+        `ref_count` on all referenced physical blocks.
+        """
+        if parent_seq_id not in self.block_tables:
+            raise ValueError(f"Parent sequence {parent_seq_id} is not active")
+        if child_seq_id in self.block_tables:
+            raise ValueError(f"Sequence {child_seq_id} already has allocated blocks")
+
+        parent_table = self.block_tables[parent_seq_id]
+        child_table = BlockTable(child_seq_id, list(parent_table.block_ids))
+        for block_id in child_table.block_ids:
+            self.blocks[block_id].ref_count += 1
+            self.cached_free_lru.pop(block_id, None)
+
+        self.block_tables[child_seq_id] = child_table
+        self.context_lens[child_seq_id] = self.context_lens[parent_seq_id]
+        if parent_seq_id in self.seq_prefix_cache_info:
+            parent_info = self.seq_prefix_cache_info[parent_seq_id]
+            self.seq_prefix_cache_info[child_seq_id] = PrefixCacheMatch(
+                block_ids=list(parent_info.block_ids),
+                cached_token_count=parent_info.cached_token_count,
+            )
+        self._update_peak_usage()
+        return child_table
+
+    def clone_sequence(self, parent_seq_id: int, child_seq_id: int) -> BlockTable:
+        """Create a child sequence by physically duplicating the parent's blocks.
+
+        Unlike `fork_sequence`, this does not share KV storage and is useful as
+        a no-sharing baseline for beam-search style experiments.
+        """
+        if parent_seq_id not in self.block_tables:
+            raise ValueError(f"Parent sequence {parent_seq_id} is not active")
+        if child_seq_id in self.block_tables:
+            raise ValueError(f"Sequence {child_seq_id} already has allocated blocks")
+
+        parent_table = self.block_tables[parent_seq_id]
+        child_table = BlockTable(child_seq_id)
+        allocated_ids: List[int] = []
+        try:
+            for parent_block_id in parent_table.block_ids:
+                parent_block = self.blocks[parent_block_id]
+                child_block = self.allocate_block()
+                allocated_ids.append(child_block.block_id)
+                child_block.num_filled = parent_block.num_filled
+                for layer_id in range(self.num_layers):
+                    self.key_cache[layer_id][child_block.block_id, : parent_block.num_filled] = (
+                        self.key_cache[layer_id][parent_block.block_id, : parent_block.num_filled]
+                    )
+                    self.value_cache[layer_id][child_block.block_id, : parent_block.num_filled] = (
+                        self.value_cache[layer_id][parent_block.block_id, : parent_block.num_filled]
+                    )
+                child_table.append_block(child_block.block_id)
+        except Exception:
+            for block_id in allocated_ids:
+                self.blocks[block_id].ref_count = 0
+                self.blocks[block_id].num_filled = 0
+                for layer_id in range(self.num_layers):
+                    self.key_cache[layer_id][block_id].fill(0)
+                    self.value_cache[layer_id][block_id].fill(0)
+                self.free_block_ids.append(block_id)
+            self.free_block_ids.sort()
+            raise
+
+        self.block_tables[child_seq_id] = child_table
+        self.context_lens[child_seq_id] = self.context_lens[parent_seq_id]
+        self._update_peak_usage()
+        return child_table
     def publish_sequence_prefix_blocks(
         self,
         seq_id: int,
@@ -501,6 +589,20 @@ class BlockManager:
                 block = self.allocate_block()
                 block_id = block.block_id
                 block_table.append_block(block.block_id)
+            elif self.blocks[block_id].ref_count > 1:
+                old_block = self.blocks[block_id]
+                block = self.allocate_block()
+                block_id = block.block_id
+                block.num_filled = old_block.num_filled
+                for layer_id in range(self.num_layers):
+                    self.key_cache[layer_id][block_id, : old_block.num_filled] = (
+                        self.key_cache[layer_id][old_block.block_id, : old_block.num_filled]
+                    )
+                    self.value_cache[layer_id][block_id, : old_block.num_filled] = (
+                        self.value_cache[layer_id][old_block.block_id, : old_block.num_filled]
+                    )
+                old_block.ref_count -= 1
+                block_table.block_ids[-1] = block_id
         self.blocks[block_id].num_filled += 1
         self.context_lens[seq_id] += 1
         return self.blocks[block_id]

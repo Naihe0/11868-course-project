@@ -652,6 +652,21 @@ def run_prefix_prefill(args, backend, backend_name, decode_backend,
             # measuring allocator setup cost rather than prefill cost, which
             # is why share_ratio=0 wrongly reported ~3x speedup.
             fresh_manager = _make_block_manager(args)
+
+            # Symmetric warm-up: the cached_manager above was implicitly warmed
+            # by the "publish base_prompt" prefill, which paid CUDA first-touch
+            # / kernel-autotune cost on its KV pool before any timed call.
+            # fresh_manager's pool is a brand-new ~hundreds-of-MB allocation
+            # that has never been touched by a kernel.  Without this throw-
+            # away prefill, the share_ratio=0 point was 1.36x instead of ~1.0x
+            # purely because the fresh path paid first-touch inside the timed
+            # region.  We run the same base_prompt through fresh_manager here
+            # so both paths enter the timed region with equal warmth.
+            _fresh_warm_sid = seq_counter[0]
+            seq_counter[0] += 1
+            model.forward_prefill(base_prompt, fresh_manager, [_fresh_warm_sid])
+            fresh_manager.free_sequence(_fresh_warm_sid)
+
             fresh_prompts: List = []
             for _ in range(num_calls):
                 fp_np = np.random.randint(

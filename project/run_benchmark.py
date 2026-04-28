@@ -53,10 +53,10 @@ def parse_args():
     parser.add_argument("--warmup-tokens", type=int, default=4,
                         help="Warmup generation tokens (not timed)")
     parser.add_argument("--output-dir", type=str, default="benchmarks/results")
-    parser.add_argument("--backend", type=str, default="cpu",
-                        choices=["cpu", "cuda"])
-    parser.add_argument("--decode-backend", type=str, default="ref",
-                        choices=["ref", "cuda"])
+    parser.add_argument("--backend", type=str, default="auto",
+                        choices=["auto", "cpu", "cuda"])
+    parser.add_argument("--decode-backend", type=str, default="auto",
+                        choices=["auto", "ref", "cuda"])
     parser.add_argument("--compare-to-ref", action="store_true",
                         help="When using CUDA decode, also run the reference "
                              "paged attention and assert the outputs match.")
@@ -94,6 +94,35 @@ def _create_backend(backend_name: str):
     return minitorch.TensorBackend(minitorch.FastOps)
 
 
+def _cuda_available() -> bool:
+    try:
+        import numba.cuda
+        return bool(numba.cuda.is_available())
+    except Exception:
+        return False
+
+
+def _resolve_backends(requested_backend: str, requested_decode_backend: str):
+    has_cuda = _cuda_available()
+
+    if requested_backend == "auto":
+        backend = "cuda" if has_cuda else "cpu"
+    else:
+        backend = requested_backend
+
+    if requested_decode_backend == "auto":
+        decode_backend = "cuda" if has_cuda else "ref"
+    else:
+        decode_backend = requested_decode_backend
+
+    if backend == "cuda" and not has_cuda:
+        raise RuntimeError("Requested backend=cuda but no CUDA device is available")
+    if decode_backend == "cuda" and not has_cuda:
+        raise RuntimeError("Requested decode-backend=cuda but no CUDA device is available")
+
+    return backend, decode_backend
+
+
 def _create_model(n_vocab, n_embd, n_head, n_positions, n_layers,
                    block_size, backend, decode_backend,
                    compare_to_ref, compare_tolerance):
@@ -128,21 +157,13 @@ def _make_prompt(batch_size, seq_len, n_vocab, backend):
 
 
 def _create_baseline_model(n_vocab, n_embd, n_head, n_positions, n_layers, backend):
-    """Create a non-paged DecoderLM baseline.
-
-    The reference DecoderLM in this repo is fixed to 4 transformer layers.
-    We only benchmark it when the requested paged model is also 4 layers so the
-    comparison remains structurally fair.
-    """
-    if n_layers != 4:
-        raise ValueError(
-            "Baseline DecoderLM is only available for n_layers=4 in this repo"
-        )
+    """Create a non-paged DecoderLM baseline with the requested depth."""
     return DecoderLM(
         n_vocab=n_vocab,
         n_embd=n_embd,
         n_head=n_head,
         n_positions=n_positions,
+        n_layers=n_layers,
         p_dropout=0.0,
         backend=backend,
     )
@@ -182,6 +203,108 @@ def _kv_cache_metrics(block_manager: BlockManager) -> Dict[str, float]:
     }
 
 
+def _memory_comparison_metrics(
+    *,
+    num_kv_blocks: int,
+    block_size: int,
+    batch_size: int,
+    seq_len: int,
+    max_new_tokens: int,
+    n_positions: int,
+    n_head: int,
+    head_dim: int,
+    n_layers: int,
+    cache_dtype,
+) -> Dict[str, float]:
+    """Compare paged working-set memory against a naive static contiguous KV reservation.
+
+    Paged working set:
+      Reserve only the blocks actually needed for the current active context.
+
+    Static contiguous baseline:
+      Reserve the full maximum context length (`n_positions`) per active sequence.
+
+    This mirrors the paper's emphasis on KV memory waste / capacity more closely
+    than comparing against the full fixed pool size alone.
+    """
+    dtype_size = np.dtype(cache_dtype).itemsize
+    active_tokens_per_seq = seq_len + max(max_new_tokens - 1, 0)
+    used_token_slots = batch_size * active_tokens_per_seq
+
+    paged_reserved_per_seq = math.ceil(active_tokens_per_seq / block_size) * block_size
+    paged_reserved_token_slots = batch_size * paged_reserved_per_seq
+    paged_reserved_bytes = (
+        paged_reserved_token_slots
+        * n_head
+        * head_dim
+        * n_layers
+        * 2
+        * dtype_size
+    )
+    paged_used_bytes = (
+        used_token_slots
+        * n_head
+        * head_dim
+        * n_layers
+        * 2
+        * dtype_size
+    )
+    paged_efficiency = (
+        paged_used_bytes / paged_reserved_bytes if paged_reserved_bytes > 0 else 0.0
+    )
+
+    static_reserved_per_seq = n_positions
+    static_reserved_token_slots = batch_size * static_reserved_per_seq
+    static_reserved_bytes = (
+        static_reserved_token_slots
+        * n_head
+        * head_dim
+        * n_layers
+        * 2
+        * dtype_size
+    )
+    static_used_bytes = paged_used_bytes
+    static_efficiency = (
+        static_used_bytes / static_reserved_bytes if static_reserved_bytes > 0 else 0.0
+    )
+
+    total_token_budget = num_kv_blocks * block_size
+    paged_max_batch = (
+        total_token_budget // paged_reserved_per_seq if paged_reserved_per_seq > 0 else 0
+    )
+    static_max_batch = (
+        total_token_budget // static_reserved_per_seq if static_reserved_per_seq > 0 else 0
+    )
+    capacity_gain = (
+        paged_max_batch / static_max_batch
+        if static_max_batch > 0
+        else float("inf") if paged_max_batch > 0 else 0.0
+    )
+    memory_reduction = (
+        1.0 - (paged_reserved_bytes / static_reserved_bytes)
+        if static_reserved_bytes > 0
+        else 0.0
+    )
+
+    return {
+        "active_tokens_per_seq": int(active_tokens_per_seq),
+        "paged_working_set_reserved_token_slots": int(paged_reserved_token_slots),
+        "paged_working_set_kv_reserved_bytes": int(paged_reserved_bytes),
+        "paged_working_set_kv_used_bytes": int(paged_used_bytes),
+        "paged_working_set_kv_efficiency": round(paged_efficiency, 4),
+        "static_kv_reserved_token_slots": int(static_reserved_token_slots),
+        "static_kv_reserved_bytes": int(static_reserved_bytes),
+        "static_kv_used_bytes": int(static_used_bytes),
+        "static_kv_efficiency": round(static_efficiency, 4),
+        "paged_memory_reduction_vs_static": round(memory_reduction, 4),
+        "paged_max_batch_under_budget": int(paged_max_batch),
+        "static_max_batch_under_budget": int(static_max_batch),
+        "paged_capacity_gain_vs_static": (
+            round(capacity_gain, 2) if math.isfinite(capacity_gain) else -1.0
+        ),
+    }
+
+
 # ---------------------------------------------------------------------------
 # Benchmark routines
 # ---------------------------------------------------------------------------
@@ -192,7 +315,7 @@ def benchmark_throughput(
     """Measure generation throughput and latency.
 
     Returns dict with: tokens_per_sec, total_time_s, time_per_token_ms,
-                       prefill_time_s, decode_time_s, decode_p50_ms, decode_p95_ms
+                       prefill_time_s, decode_time_s
     """
     batch_size = prompt.shape[0]
 
@@ -206,9 +329,8 @@ def benchmark_throughput(
     last_logits_np = logits.to_numpy()[:, -1, :]
     next_tokens = np.argmax(last_logits_np, axis=-1)
 
-    # --- Decode timing (per-step latency captured for percentile stats) ---
+    # --- Decode timing ---
     prompt_len = prompt.shape[1]
-    per_step_ms: List[float] = []
     decode_start = time.perf_counter()
     for step in range(1, max_new_tokens):
         token_input = tensor_from_numpy(
@@ -216,15 +338,11 @@ def benchmark_throughput(
             backend=model.backend,
         )
         start_pos = prompt_len + step - 1
-        step_t0 = time.perf_counter()
         logits = model.forward_decode(
             token_input, block_manager, seq_ids, start_pos=start_pos,
         )
         logits_np = logits.to_numpy()[:, 0, :]
         next_tokens = np.argmax(logits_np, axis=-1)
-        step_t1 = time.perf_counter()
-        # Per-token latency (ms / token), normalized over the batch
-        per_step_ms.append((step_t1 - step_t0) * 1000.0 / batch_size)
     decode_end = time.perf_counter()
     decode_time = decode_end - decode_start
 
@@ -238,12 +356,6 @@ def benchmark_throughput(
     for seq_id in seq_ids:
         block_manager.free_sequence(seq_id)
 
-    if per_step_ms:
-        p50 = float(np.percentile(per_step_ms, 50))
-        p95 = float(np.percentile(per_step_ms, 95))
-    else:
-        p50 = p95 = 0.0
-
     metrics = {
         "total_time_s": round(total_time, 4),
         "prefill_time_s": round(prefill_time, 4),
@@ -251,8 +363,6 @@ def benchmark_throughput(
         "tokens_per_sec": round(total_generated / total_time, 2) if total_time > 0 else 0,
         "decode_tokens_per_sec": round(decode_tokens / decode_time, 2) if decode_time > 0 else 0,
         "time_per_token_ms": round((decode_time / decode_tokens) * 1000, 2) if decode_tokens > 0 else 0,
-        "decode_p50_ms": round(p50, 2),
-        "decode_p95_ms": round(p95, 2),
     }
     metrics.update(kv_metrics)
     return metrics
@@ -665,6 +775,7 @@ def check_correctness(
 
 def main():
     args = parse_args()
+    backend_name, decode_backend = _resolve_backends(args.backend, args.decode_backend)
 
     os.makedirs(args.output_dir, exist_ok=True)
     results_file = os.path.join(args.output_dir, "benchmark_results.csv")
@@ -678,13 +789,14 @@ def main():
     print(f"Seq lengths: {args.seq_lengths}")
     print(f"Block sizes: {args.block_sizes}")
     print(f"New tokens:  {args.max_new_tokens}")
-    print(f"Backend:     {args.backend}")
+    print(f"Backend:     {backend_name}")
+    print(f"Decode:      {decode_backend}")
     print(f"Baseline:    {'yes' if args.compare_baseline else 'no'}")
     print(f"Output:      {results_file}")
     print("=" * 70)
     print()
 
-    backend = _create_backend(args.backend)
+    backend = _create_backend(backend_name)
     head_dim = args.n_embd // args.n_head
 
     all_results: List[Dict] = []
@@ -702,7 +814,7 @@ def main():
                 block_size,
                 args.num_kv_blocks,
                 backend,
-                args.decode_backend,
+                decode_backend,
                 args.compare_to_ref,
                 args.compare_tolerance,
             )
@@ -740,7 +852,7 @@ def main():
                         args.n_vocab, args.n_embd, args.n_head,
                         args.n_positions, args.n_layers,
                         block_size, backend,
-                        args.decode_backend,
+                        decode_backend,
                         args.compare_to_ref,
                         args.compare_tolerance,
                     )
@@ -766,10 +878,23 @@ def main():
                     )
                     frag = benchmark_fragmentation(
                         bm_frag, batch_size, seq_len, block_size,
-                        contiguous_max_seq_len=args.n_positions,
                     )
 
                     result = {**config, **throughput, **frag}
+                    result.update(
+                        _memory_comparison_metrics(
+                            num_kv_blocks=args.num_kv_blocks,
+                            block_size=block_size,
+                            batch_size=batch_size,
+                            seq_len=seq_len,
+                            max_new_tokens=args.max_new_tokens,
+                            n_positions=args.n_positions,
+                            n_head=args.n_head,
+                            head_dim=head_dim,
+                            n_layers=args.n_layers,
+                            cache_dtype=CACHE_DTYPE,
+                        )
+                    )
                     if not args.skip_correctness:
                         result.update(corr)
 
@@ -815,7 +940,7 @@ def main():
                                 block_size,
                                 seq_len,
                                 backend,
-                                args.decode_backend,
+                                decode_backend,
                                 args.compare_to_ref,
                                 args.compare_tolerance,
                                 args.prefix_shared_ratio,
@@ -829,7 +954,14 @@ def main():
                     msg = (f"OK  {throughput['tokens_per_sec']:.1f} tok/s, "
                            f"int_frag={frag['internal_frag']:.3f}, "
                            f"decode={throughput['time_per_token_ms']:.1f}ms/tok, "
-                           f"kv_eff={throughput['kv_efficiency']:.3f}")
+                           f"kv_eff={throughput['kv_efficiency']:.3f}, "
+                           f"ws_eff={result['paged_working_set_kv_efficiency']:.3f}, "
+                           f"static_eff={result['static_kv_efficiency']:.3f}")
+                    if "paged_memory_reduction_vs_static" in result:
+                        msg += (
+                            f" | mem_red={result['paged_memory_reduction_vs_static'] * 100:.1f}%"
+                            f" cap_gain={result['paged_capacity_gain_vs_static']:.2f}x"
+                        )
                     if baseline_info:
                         msg += (
                             f" | baseline total={baseline_info['baseline_total_time_s']:.3f}s"
@@ -855,7 +987,7 @@ def main():
                     args.n_vocab, args.n_embd, args.n_head,
                     args.n_layers, args.n_positions,
                     args.num_kv_blocks, block_size, seq_len,
-                    args.backend,
+                    backend_name,
                 )
                 print(f"  [block_size={block_size}, seq={seq_len}] "
                       f"Max batch size: {max_bs}")
@@ -926,8 +1058,9 @@ def main():
         has_baseline = any("baseline_tokens_per_sec" in r for r in all_results)
         has_prefix = any("prefix_prefill_speedup" in r for r in all_results)
         header = (f"{'BS':>3} {'Batch':>5} {'SeqLen':>6} "
-                  f"{'tok/s':>8} {'ms/tok':>8} {'p50':>6} {'p95':>6} "
-                  f"{'IntFrag':>8} {'Util':>6} {'KVeff':>6} {'MemSav':>7}")
+                  f"{'tok/s':>8} {'ms/tok':>8} "
+                  f"{'IntFrag':>8} {'Util':>6} {'KVeff':>6}"
+                  f" {'WsEff':>6} {'StEff':>6} {'Cap':>6}")
         if has_baseline:
             header += (
                 f"  {'BL tok/s':>8} {'BL ms/tok':>9}"
@@ -936,18 +1069,18 @@ def main():
         if has_prefix:
             header += f" {'PHit':>5} {'PSpd':>6}"
         print(header)
-        print("-" * (len(header) + 4))
+        print("-" * (70 if not has_baseline and not has_prefix else 128))
         for r in all_results:
             row = (f"{r['block_size']:>3} {r['batch_size']:>5} "
                    f"{r['seq_len']:>6} "
                    f"{r['tokens_per_sec']:>8.1f} "
                    f"{r['time_per_token_ms']:>8.1f} "
-                   f"{r.get('decode_p50_ms', 0):>6.1f} "
-                   f"{r.get('decode_p95_ms', 0):>6.1f} "
                    f"{r['internal_frag']:>8.4f} "
                    f"{r['utilization']:>6.3f} "
                    f"{r['kv_efficiency']:>6.3f} "
-                   f"{r.get('memory_savings_ratio', 0):>7.3f}")
+                   f"{r['paged_working_set_kv_efficiency']:>6.3f} "
+                   f"{r['static_kv_efficiency']:>6.3f} "
+                   f"{r['paged_capacity_gain_vs_static']:>5.2f}x")
             if has_baseline and "baseline_time_per_token_ms" in r:
                 row += (
                     f"  {r['baseline_tokens_per_sec']:>8.1f}"
