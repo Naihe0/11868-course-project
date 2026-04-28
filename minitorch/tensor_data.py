@@ -161,7 +161,9 @@ class TensorData:
         shape: UserShape,
         strides: Optional[UserStrides] = None,
     ):
-        if isinstance(storage, np.ndarray):
+        if numba.cuda.is_cuda_array(storage):
+            self._storage = storage
+        elif isinstance(storage, np.ndarray):
             self._storage = storage.astype(datatype)
         else:
             self._storage = array(storage, dtype=datatype)
@@ -237,10 +239,15 @@ class TensorData:
         return tuple((random.randint(0, s - 1) for s in self.shape))
 
     def get(self, key: UserIndex) -> float:
-        x: float = self._storage[self.index(key)]
+        storage = self._storage
+        if numba.cuda.is_cuda_array(storage):
+            storage = storage.copy_to_host()
+        x: float = storage[self.index(key)]
         return x
 
     def set(self, key: UserIndex, val: float) -> None:
+        if numba.cuda.is_cuda_array(self._storage):
+            raise IndexingError("Direct scalar assignment is not supported for CUDA TensorData")
         self._storage[self.index(key)] = val
 
     def tuple(self) -> Tuple[Storage, Shape, Strides]:

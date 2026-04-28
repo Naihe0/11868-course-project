@@ -1,209 +1,184 @@
 # PagedAttention in MiniTorch
 
-Reimplementation of [PagedAttention](https://arxiv.org/abs/2309.06180) within the MiniTorch educational deep learning framework, as proposed for the 11-868 course project.
+This repository reimplements the core ideas behind PagedAttention inside the MiniTorch educational deep learning framework. It includes a block-based KV cache allocator, Python reference PagedAttention, an optional CUDA decode kernel/runtime, a decoder-only language model integration, tests, and benchmark scripts.
 
-## Overview
+The best place to understand the project is the maintained guide in [docs/README.md](docs/README.md). It is written for readers who are new to PagedAttention and only lightly familiar with transformers.
 
-PagedAttention is a memory-efficient attention mechanism for LLM inference that manages the KV cache in non-contiguous memory blocks, inspired by virtual memory paging. This project integrates it into MiniTorch to provide a clear, accessible implementation that demonstrates system-level challenges in modern LLM serving.
+## What This Project Implements
 
-### Key Components
+- `minitorch/block_manager.py`: fixed-size physical KV blocks, per-sequence block tables, prefix-cache lookup/publish, allocation/freeing, fragmentation, and memory accounting.
+- `minitorch/paged_attention.py`: contiguous reference attention, Python paged-attention reference, ctypes wrapper for the CUDA library, and the MiniTorch multi-head attention module.
+- `minitorch/transformer.py`: decoder-only LM with prefill, decode, prefix-hit grouping, generation, and runtime cleanup.
+- `src/paged_attention.cu`: custom CUDA PagedAttention decode kernel plus a stateful runtime API for device-side cache synchronization.
+- `project/run_inference.py`: synthetic inference driver.
+- `project/run_benchmark.py`: general throughput, fragmentation, capacity, correctness, baseline, and prefix-cache benchmark driver.
+- `project/run_rigorous_benchmark.py`: six-experiment benchmark suite used for report/poster figures.
 
-- **Block Manager** (`minitorch/block_manager.py`): Block-based memory allocator for KV cache pages
-- **PagedAttention Kernel** (`src/paged_attention.cu`): Custom CUDA kernel for attention over non-contiguous memory blocks
-- **Transformer Integration** (`minitorch/transformer.py`): Transformer model with PagedAttention support
-- **Benchmarking** (`project/run_benchmark.py`): Evaluation scripts for memory and throughput
+## Documentation
 
-## Project Structure
+Start here:
 
-```
+- [docs/README.md](docs/README.md): documentation hub and reading order.
+- [docs/README.zh-CN.md](docs/README.zh-CN.md): single-file Simplified Chinese version of the guide.
+- [docs/foundations/minitorch-primer.md](docs/foundations/minitorch-primer.md): MiniTorch concepts used by this project.
+- [docs/foundations/transformer-and-kv-cache.md](docs/foundations/transformer-and-kv-cache.md): beginner transformer, KV cache, and PagedAttention primer.
+- [docs/core/block-manager.md](docs/core/block-manager.md): allocator walkthrough.
+- [docs/core/paged-attention-python.md](docs/core/paged-attention-python.md): Python/reference attention walkthrough.
+- [docs/core/cuda-kernel-and-runtime.md](docs/core/cuda-kernel-and-runtime.md): CUDA kernel/runtime walkthrough.
+- [docs/core/transformer-integration.md](docs/core/transformer-integration.md): model lifecycle walkthrough.
+- [docs/reference/code-inventory.md](docs/reference/code-inventory.md): map of code-bearing files and artifacts.
+
+Historical project material remains in [docs/design.md](docs/design.md), [docs/REVIEW.md](docs/REVIEW.md), [docs/reports/](docs/reports/), and [benchmarks/README.md](benchmarks/README.md).
+
+## Repository Layout
+
+```text
 11868-course-project/
 ├── README.md
+├── compile_cuda.sh
+├── requirements.txt
 ├── setup.py
 ├── setup.cfg
-├── requirements.txt
-├── compile_cuda.sh
 ├── pytest.ini
-├── src/
-│   ├── combine.cu                 # Base MiniTorch CUDA ops (from hw3)
-│   ├── softmax_kernel.cu          # Attention softmax CUDA kernel (from hw4)
-│   ├── layernorm_kernel.cu        # LayerNorm CUDA kernel (from hw4)
-│   ├── includes/                  # Shared CUDA headers (from hw4)
-│   └── paged_attention.cu         # PagedAttention CUDA kernel (this project)
 ├── minitorch/
-│   ├── __init__.py
-│   ├── autodiff.py                
-│   ├── module.py                  
-│   ├── modules_basic.py           
-│   ├── tensor.py                  
-│   ├── tensor_data.py             
-│   ├── tensor_functions.py        
-│   ├── tensor_ops.py              
-│   ├── nn.py                     
-│   ├── operators.py              
-│   ├── optim.py                   
-│   ├── fast_ops.py                
-│   ├── cuda_ops.py                
-│   ├── cuda_kernel_ops.py         
-│   ├── datasets.py                
-│   ├── testing.py                 
-│   ├── scalar.py                  
-│   ├── scalar_functions.py       
-│   ├── cuda_kernels/              # Compiled .so files
-│   ├── block_manager.py           # NEW: Block-based KV cache memory manager
-│   ├── paged_attention.py         # NEW: PagedAttention mechanism
-│   └── transformer.py             # MODIFIED: Transformer with PagedAttention
+│   ├── block_manager.py
+│   ├── paged_attention.py
+│   ├── transformer.py
+│   └── ... MiniTorch framework files ...
+├── src/
+│   ├── paged_attention.cu
+│   ├── combine.cu
+│   ├── softmax_kernel.cu
+│   ├── layernorm_kernel.cu
+│   └── includes/
 ├── project/
-│   ├── run_inference.py           # Inference with PagedAttention
-│   └── run_benchmark.py           # Performance evaluation
+│   ├── run_inference.py
+│   ├── run_benchmark.py
+│   ├── run_rigorous_benchmark.py
+│   ├── run_gpt2_paged_benchmark.py
+│   ├── contiguous_kv_baseline.py
+│   ├── plot.py
+│   ├── plot_gpt2_benchmark.py
+│   └── plot_rigorous_figures.py
 ├── tests/
-│   ├── __init__.py
-│   ├── test_block_manager.py      # Block manager unit tests
-│   ├── test_paged_attention.py    # PagedAttention correctness tests
-│   └── test_benchmark.py          # Performance regression tests
+│   ├── test_block_manager.py
+│   ├── test_paged_attention.py
+│   ├── test_parity.py
+│   └── test_benchmark.py
 ├── benchmarks/
-│   └── README.md                  # Benchmark results and plots
 └── docs/
-    └── design.md                  # Design document
 ```
 
 ## Setup
 
-### Prerequisites
-
-- Python 3.10+
-- CUDA Toolkit (compatible with V100 GPUs)
-- PSC compute node access (V100-16GB or V100-32GB)
-
-### Installation
+CPU reference path:
 
 ```bash
-# 1. Copy base MiniTorch files from hw3
-#    Copy all files marked "(from hw3)" in the structure above
-#    from ../llmsys_hw3/minitorch/ into ./minitorch/
-
-# 2. Install dependencies
 pip install -r requirements.txt
-
-# 3. Compile CUDA kernels
-module load cuda/12.4
-bash compile_cuda.sh
-
-# 4. Install the package in development mode
 pip install -e .
 ```
 
-### Running Tests
+CUDA path:
 
 ```bash
-# Run all tests
-pytest tests/
+module load cuda/12.4  # if your environment uses modules
+bash compile_cuda.sh
+```
 
-# Run specific test suites
-pytest tests/test_block_manager.py -v
-pytest tests/test_paged_attention.py -v
+Detailed setup notes, including Windows/WSL and CUDA context caveats, are in [docs/usage/setup-and-build.md](docs/usage/setup-and-build.md).
 
-# Run only BlockManager tests quietly
+## Run Inference
+
+CPU reference decode:
+
+```bash
+python project/run_inference.py \
+  --backend cpu \
+  --decode-backend ref \
+  --batch-size 1 \
+  --prompt-len 16 \
+  --max-new-tokens 8
+```
+
+CUDA decode after compiling kernels:
+
+```bash
+python project/run_inference.py \
+  --backend cuda \
+  --decode-backend cuda \
+  --compare-to-ref \
+  --batch-size 1 \
+  --prompt-len 16 \
+  --max-new-tokens 8
+```
+
+More examples and flag explanations are in [docs/usage/running-inference.md](docs/usage/running-inference.md).
+
+## Run Tests
+
+```bash
+pytest tests/ -q
+```
+
+Focused suites:
+
+```bash
 pytest tests/test_block_manager.py -q
-
-# Run only PagedAttention reference / correctness tests quietly
 pytest tests/test_paged_attention.py -q
-
-# Run one specific PagedAttention test
-pytest tests/test_paged_attention.py -k test_single_sequence_multi_block -v
+pytest tests/test_parity.py -q
+pytest tests/test_benchmark.py -q
 ```
 
-### Running Benchmarks
+CUDA-specific tests skip automatically when CUDA or the compiled shared library is unavailable. See [docs/usage/testing-and-benchmarking.md](docs/usage/testing-and-benchmarking.md).
+
+## Run Benchmarks
+
+General benchmark:
 
 ```bash
-# Run inference with PagedAttention
-python project/run_inference.py
-
-# Run performance benchmarks
-python project/run_benchmark.py --batch-sizes 1 2 4 8 --seq-lengths 128 256 512 1024
+python project/run_benchmark.py \
+  --batch-sizes 1 2 4 \
+  --seq-lengths 32 64 128 \
+  --block-sizes 8 16 \
+  --max-new-tokens 16 \
+  --compare-baseline \
+  --compare-prefix-cache
 ```
 
-## Evaluation Metrics
+Plot general benchmark results:
 
-- **Memory fragmentation**: Internal and external fragmentation of KV cache
-- **Maximum batch size**: Largest batch before OOM
-- **Throughput**: Tokens/second for generation
-- **Correctness**: Output matches standard attention exactly
+```bash
+python project/plot.py
+```
 
-## TODO
+GPT-2 real-data MiniTorch GPU KV benchmark:
 
-### Repository completeness
+```bash
+python project/run_gpt2_paged_benchmark.py \
+  --model-name gpt2 \
+  --dataset-name wikitext \
+  --dataset-config wikitext-2-raw-v1 \
+  --dataset-split test \
+  --batch-sizes 1 \
+  --seq-lengths 1 \
+  --warmup-iters 0 \
+  --timed-iters 1
+python project/plot_gpt2_benchmark.py
+```
 
-- [x] Copy the base MiniTorch files from hw3 into `minitorch/`
-- [x] Add missing CUDA source files required by `compile_cuda.sh` (`combine.cu`, `softmax_kernel.cu`, `layernorm_kernel.cu`, `includes/`)
-- [ ] Verify that `pip install -e .` and `import minitorch` work in a clean environment
+Rigorous report/poster benchmark:
 
-### Block manager
+```bash
+python project/run_rigorous_benchmark.py \
+  --output-dir benchmarks/results_rigorous \
+  --backend auto \
+  --decode-backend auto
+python project/plot_rigorous_figures.py
+```
 
-- [x] Implement `BlockManager.allocate_block()`
-- [x] Implement `BlockManager.allocate_blocks_for_sequence()`
-- [x] Implement `BlockManager.append_token_to_sequence()`
-- [x] Implement `BlockManager.free_sequence()`
-- [x] Implement `BlockManager.compute_fragmentation()`
-- [x] Move KV storage to global `key_cache` / `value_cache` owned by `BlockManager`
-
-### Attention implementation
-
-- [x] Implement `standard_attention()` as the contiguous correctness baseline
-- [x] Implement `paged_attention_ref()` for Python-side validation
-- [x] Implement `PagedAttentionKernel._load_library()`
-- [x] Implement `PagedAttentionKernel.forward()`
-- [x] Initialize Q / K / V / output projections in `PagedMultiHeadAttention`
-- [x] Implement `PagedMultiHeadAttention.forward_prefill()`
-- [x] Implement `PagedMultiHeadAttention.forward_decode()`
-
-### Transformer integration
-
-- [x] Implement `PagedTransformerLayer.forward_prefill()`
-- [x] Implement `PagedTransformerLayer.forward_decode()`
-- [x] Implement `PagedDecoderLM.generate()`
-- [x] Verify end-to-end prefill/decode behavior with sequence position tracking
-
-### CUDA kernel
-
-- [x] Implement `warp_reduce_sum()`
-- [x] Implement `warp_reduce_max()`
-- [x] Implement `paged_attention_v1_kernel()`
-- [x] Validate kernel launch configuration across supported head dimensions
-- [x] Compile `minitorch/cuda_kernels/paged_attention.so` (kernel body still needs implementation)
-- [x] Test CUDA kernel produces correct output
-
-### Optional advanced TODOs
-
-- [ ] Rework KV cache memory layout to better match coalesced GPU memory access
-- [ ] Add a higher-performance kernel path inspired by vLLM's paged attention design
-- [ ] Introduce thread-group / warp-level work partitioning instead of a purely naive per-head kernel
-- [ ] Use shared memory staging for query vectors and partial reductions
-- [ ] Implement more efficient online softmax and value accumulation reductions
-- [ ] Add template-specialized kernels for different `head_dim`, `block_size`, and thread-count configurations
-- [ ] Benchmark multiple kernel variants and select launch parameters per configuration
-- [ ] Explore multi-block-per-sequence kernel decomposition for long-context decode
-- [ ] Add CUDA profiling with Nsight or equivalent tooling to analyze memory bandwidth and occupancy
-- [ ] Compare the course-project kernel against a vLLM-style design in the final report
-- [ ] Evaluate tradeoffs between implementation simplicity, numerical stability, and throughput
-- [ ] Document which optimizations are correctness-preserving versus performance-only
-
-### Tests
-
-- [x] Fill in `tests/test_block_manager.py`
-- [x] Fill in `tests/test_paged_attention.py`
-- [x] Fill in the remaining performance cycle test in `tests/test_benchmark.py`
-- [x] Add an end-to-end inference smoke test once the model path is runnable
-
-### Benchmarks and reporting
-
-- [x] Implement throughput measurement in `project/run_benchmark.py`
-- [x] Implement fragmentation measurement in `project/run_benchmark.py`
-- [x] Implement max-batch-size search in `project/run_benchmark.py`
-- [x] Implement correctness comparison in `project/run_benchmark.py`
-- [x] Save benchmark outputs to `benchmarks/results/benchmark_results.csv`
-- [ ] Add benchmark plots / summary discussion to `benchmarks/README.md`
+Benchmark interpretation is documented in [docs/advanced/memory-and-capacity.md](docs/advanced/memory-and-capacity.md) and [docs/usage/testing-and-benchmarking.md](docs/usage/testing-and-benchmarking.md).
 
 ## References
 
-- Kwon et al., "Efficient Memory Management for Large Language Model Serving with PagedAttention", SOSP 2023
+- Kwon et al., "Efficient Memory Management for Large Language Model Serving with PagedAttention", SOSP 2023.
 - vLLM: https://github.com/vllm-project/vllm

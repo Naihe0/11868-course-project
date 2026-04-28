@@ -1,5 +1,7 @@
 #!/bin/bash
-set -e
-source /mnt/c/Users/yangn/projects/11868/.venv/bin/activate
-cd /mnt/c/Users/yangn/projects/11868/11868-course-project
+set -euo pipefail
+
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+source "$SCRIPT_DIR/.venv/bin/activate"
+cd "$SCRIPT_DIR"
 exec "$@"

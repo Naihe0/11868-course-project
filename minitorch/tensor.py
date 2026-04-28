@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 import numpy as np
+import numba
 
 from . import operators
 from .autodiff import Context, Variable, backpropagate
@@ -119,7 +120,10 @@ class Tensor:
         Returns:
              Converted to numpy array
         """
-        return self.contiguous()._tensor._storage.reshape(self.shape)
+        storage = self.contiguous()._tensor._storage
+        if numba.cuda.is_cuda_array(storage):
+            storage = storage.copy_to_host()
+        return storage.reshape(self.shape)
 
     # Properties
     @property
@@ -227,7 +231,10 @@ class Tensor:
 
     def item(self) -> float:
         assert self.size == 1
-        x: float = self._tensor._storage[0]
+        storage = self._tensor._storage
+        if numba.cuda.is_cuda_array(storage):
+            storage = storage.copy_to_host()
+        x: float = storage[0]
         return x
 
     def sum(self, dim: Optional[int] = None) -> Tensor:
@@ -307,7 +314,10 @@ class Tensor:
         backend: Optional[TensorBackend] = None,
     ) -> Tensor:
         "Create a new tensor from data"
-        return Tensor(TensorData(storage, shape, strides), backend=backend)
+        out = Tensor(TensorData(storage, shape, strides), backend=backend)
+        if backend is not None:
+            out._type_(backend)
+        return out
 
     def expand(self, other: Tensor) -> Tensor:
         """

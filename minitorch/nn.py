@@ -90,7 +90,7 @@ def argmax(input: Tensor, dim: int) -> Tensor:
         :class:`Tensor` : tensor with 1 on highest cell in dim, 0 otherwise
 
     """
-    out = max_reduce(input, dim)
+    out = input.backend.max_reduce(input, dim)
     return out == input
 
 
@@ -99,7 +99,7 @@ class Max(Function):
     def forward(ctx: Context, input: Tensor, dim: Tensor) -> Tensor:
         "Forward of max should be max reduction"
         # ASSIGN4.4
-        out = max_reduce(input, int(dim.item()))
+        out = input.backend.max_reduce(input, int(dim.item()))
         ctx.save_for_backward(input, out)
         return out
         # END ASSIGN4.4

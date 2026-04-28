@@ -6,6 +6,8 @@ Embedding
 
 """
 import numpy as np
+import numba
+from numba import cuda
 from math import sqrt
 from .module import Module, Parameter
 from .tensor_functions import (MatMul ,Add, Mul, PowerScalar ,zeros, ones, rand, tensor, tensor_from_numpy, zeros_tensor_from_numpy, ones_tensor_from_numpy)
@@ -17,6 +19,16 @@ from .operators import prod
 
 from typing import Any, Dict, Optional, Sequence, Tuple
 from .tensor_functions import LayerNorm
+
+
+@cuda.jit
+def _embedding_lookup_kernel(out, token_ids, weights, total, embedding_dim):
+    pos = cuda.blockIdx.x * cuda.blockDim.x + cuda.threadIdx.x
+    if pos < total:
+        emb_dim = pos % embedding_dim
+        token_pos = pos // embedding_dim
+        token_id = int(token_ids[token_pos])
+        out[pos] = weights[token_id * embedding_dim + emb_dim]
 
 class Embedding(Module):
     def __init__(self, num_embeddings: int, embedding_dim: int, backend: TensorBackend):
@@ -52,10 +64,34 @@ class Embedding(Module):
             output : Tensor of shape (batch_size, seq_len, embedding_dim)
         """
         bs, seq_len = x.shape
-        x = x.view(1, bs*seq_len)
-        one_hot_result = one_hot(x, self.num_embeddings)
-        result =  MatMul.apply(one_hot_result, self.weights.value)
-        return result.view(bs, seq_len, self.embedding_dim)
+        if getattr(x.backend, "cuda", False):
+            out = x.zeros((bs, seq_len, self.embedding_dim))
+            total = bs * seq_len * self.embedding_dim
+            threads = 128
+            blocks = (total + threads - 1) // threads
+            token_storage = (
+                x._tensor._storage
+                if x._tensor.is_contiguous()
+                else x.contiguous()._tensor._storage
+            )
+            weight_tensor = self.weights.value
+            weight_storage = (
+                weight_tensor._tensor._storage
+                if weight_tensor._tensor.is_contiguous()
+                else weight_tensor.contiguous()._tensor._storage
+            )
+            _embedding_lookup_kernel[blocks, threads](
+                out._tensor._storage,
+                token_storage,
+                weight_storage,
+                total,
+                self.embedding_dim,
+            )
+            return out
+
+        token_ids = x.to_numpy().astype(np.int64)
+        embedded = self.weights.value.to_numpy()[token_ids]
+        return tensor_from_numpy(embedded.astype(np.float32), backend=self.backend)
 
 
     

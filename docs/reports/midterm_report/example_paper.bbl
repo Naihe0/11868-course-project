@@ -1,0 +1,68 @@
+\begin{thebibliography}{9}
+\providecommand{\natexlab}[1]{#1}
+\providecommand{\url}[1]{\texttt{#1}}
+\expandafter\ifx\csname urlstyle\endcsname\relax
+  \providecommand{\doi}[1]{doi: #1}\else
+  \providecommand{\doi}{doi: \begingroup \urlstyle{rm}\Url}\fi
+
+\bibitem[Dao(2024)]{dao2023flashattention2}
+Dao, T.
+\newblock {FlashAttention-2}: Faster attention with better parallelism and work
+  partitioning.
+\newblock In \emph{International Conference on Learning Representations
+  (ICLR)}, 2024.
+
+\bibitem[Dao et~al.(2022)Dao, Fu, Ermon, Rudra, and
+  R{\'e}]{dao2022flashattention}
+Dao, T., Fu, D.~Y., Ermon, S., Rudra, A., and R{\'e}, C.
+\newblock {FlashAttention}: Fast and memory-efficient exact attention with
+  {IO}-awareness.
+\newblock In \emph{Advances in Neural Information Processing Systems
+  (NeurIPS)}, 2022.
+
+\bibitem[{Hugging Face}(2023)]{huggingface2023tgi}
+{Hugging Face}.
+\newblock Text generation inference.
+\newblock \url{https://github.com/huggingface/text-generation-inference}, 2023.
+
+\bibitem[Kwon et~al.(2023)Kwon, Li, Zhuang, Sheng, Zheng, Yu, Gonzalez, Zhang,
+  and Stoica]{kwon2023efficient}
+Kwon, W., Li, Z., Zhuang, S., Sheng, Y., Zheng, L., Yu, C.~H., Gonzalez, J.~E.,
+  Zhang, H., and Stoica, I.
+\newblock Efficient memory management for large language model serving with
+  {PagedAttention}.
+\newblock In \emph{Proceedings of the 29th ACM Symposium on Operating Systems
+  Principles (SOSP)}, pp.\  611--626. ACM, 2023.
+
+\bibitem[{NVIDIA}(2024)]{tensorrtllm2024}
+{NVIDIA}.
+\newblock {TensorRT-LLM}.
+\newblock \url{https://github.com/NVIDIA/TensorRT-LLM}, 2024.
+
+\bibitem[Rush(2020)]{rush2020minitorch}
+Rush, A.
+\newblock {MiniTorch}: A {DIY} teaching library for machine learning
+  engineering.
+\newblock \url{https://minitorch.github.io/}, 2020.
+
+\bibitem[Silberschatz et~al.(2018)Silberschatz, Galvin, and
+  Gagne]{silberschatz2018os}
+Silberschatz, A., Galvin, P.~B., and Gagne, G.
+\newblock \emph{Operating System Concepts}.
+\newblock Wiley, 10th edition, 2018.
+
+\bibitem[Xiong et~al.(2020)Xiong, Yang, He, Zheng, Zheng, Xing, Zhang, Lan,
+  Wang, and Liu]{xiong2020layer}
+Xiong, R., Yang, Y., He, D., Zheng, K., Zheng, S., Xing, C., Zhang, H., Lan,
+  Y., Wang, L., and Liu, T.-Y.
+\newblock On layer normalization in the transformer architecture.
+\newblock In \emph{International Conference on Machine Learning (ICML)}. PMLR,
+  2020.
+
+\bibitem[Ye et~al.(2025)Ye, Chen, Lai, Lin, Zhang, Wang, and
+  Chen]{ye2025flashinfer}
+Ye, Z., Chen, L., Lai, R., Lin, W., Zhang, Y., Wang, S., and Chen, T.
+\newblock {FlashInfer}: Efficient and customizable attention engine for {LLM}
+  inference serving, 2025.
+
+\end{thebibliography}

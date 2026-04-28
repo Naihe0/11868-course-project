@@ -78,6 +78,7 @@ class PagedTransformerLayer(Module):
         decode_backend: str = "ref",
         compare_to_ref: bool = False,
         compare_tolerance: float = 1e-4,
+        gpu_resident_kv: bool = False,
     ):
         super().__init__()
         self.ln_1 = LayerNorm1d(n_embd, ln_eps, backend)
@@ -89,6 +90,7 @@ class PagedTransformerLayer(Module):
             decode_backend=decode_backend,
             compare_to_ref=compare_to_ref,
             compare_tolerance=compare_tolerance,
+            gpu_resident_kv=gpu_resident_kv,
         )
         self.ff = FeedForward(
             n_embd, middle_dim=4 * n_embd,
@@ -161,6 +163,7 @@ class PagedDecoderLM(Module):
         decode_backend: str = "ref",
         compare_to_ref: bool = False,
         compare_tolerance: float = 1e-4,
+        gpu_resident_kv: bool = False,
     ):
         super().__init__()
         self.backend = backend
@@ -183,6 +186,7 @@ class PagedDecoderLM(Module):
                 decode_backend=decode_backend,
                 compare_to_ref=compare_to_ref,
                 compare_tolerance=compare_tolerance,
+                gpu_resident_kv=gpu_resident_kv,
             )
             setattr(self, f"layer_{layer_id}", layer)
             self.layers.append(layer)

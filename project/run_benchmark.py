@@ -68,6 +68,13 @@ def parse_args():
     parser.add_argument("--compare-baseline", action="store_true",
                         help="Also benchmark the non-paged DecoderLM (hw3/hw4) "
                              "for throughput comparison")
+    parser.add_argument("--frag-seq-lengths", type=int, nargs="+",
+                        default=[33, 65, 100, 130],
+                        help="Sequence lengths used for the dedicated "
+                             "fragmentation sweep (chosen to NOT divide "
+                             "evenly into the block sizes).")
+    parser.add_argument("--skip-frag-sweep", action="store_true",
+                        help="Skip the dedicated non-aligned fragmentation sweep")
     parser.add_argument("--compare-prefix-cache", action="store_true",
                         help="Benchmark second-request prefill when the prompt "
                              "shares a prefix with a previously cached request")
@@ -560,17 +567,27 @@ def benchmark_prefix_cache_prefill(
 
 
 def benchmark_fragmentation(block_manager, batch_size, seq_len,
-                             block_size) -> Dict[str, float]:
-    """Measure internal and external memory fragmentation after allocation.
+                             block_size, contiguous_max_seq_len: Optional[int] = None) -> Dict[str, float]:
+    """Measure internal/external fragmentation and KV memory vs contiguous.
 
     Allocates blocks for `batch_size` sequences of `seq_len` tokens,
-    measures fragmentation, then frees them.
+    measures fragmentation and KV bytes (paged vs naive contiguous),
+    then frees them.
+
+    Args:
+        contiguous_max_seq_len: Max seq length the naive contiguous baseline
+            would reserve per sequence. Defaults to ``seq_len`` (an optimistic
+            baseline that already knows the exact length); pass a larger value
+            (e.g. ``n_positions``) to model the realistic worst case.
     """
     seq_ids = list(range(1000, 1000 + batch_size))
     for seq_id in seq_ids:
         block_manager.allocate_blocks_for_sequence(seq_id, seq_len)
 
     frag = block_manager.compute_fragmentation()
+    if contiguous_max_seq_len is None:
+        contiguous_max_seq_len = seq_len
+    mem = block_manager.compute_kv_memory(max_seq_len=contiguous_max_seq_len)
 
     utilization = 0.0
     used = block_manager.num_used_blocks
@@ -587,6 +604,9 @@ def benchmark_fragmentation(block_manager, batch_size, seq_len,
         "blocks_used": used,
         "blocks_total": total,
         "utilization": round(utilization, 4),
+        "kv_bytes_paged": int(mem["kv_bytes_paged"]),
+        "kv_bytes_contiguous_naive": int(mem["kv_bytes_contiguous_naive"]),
+        "memory_savings_ratio": round(mem["memory_savings_ratio"], 4),
     }
 
 
@@ -972,7 +992,54 @@ def main():
                 print(f"  [block_size={block_size}, seq={seq_len}] "
                       f"Max batch size: {max_bs}")
 
-    # Write CSV
+    # ---------------- Dedicated fragmentation sweep ----------------
+    # Use seq lengths that DO NOT divide evenly by the block sizes so
+    # internal fragmentation is non-zero and visible in the report.
+    frag_results: List[Dict] = []
+    if not args.skip_frag_sweep:
+        print("\n" + "=" * 70)
+        print("FRAGMENTATION SWEEP (non-aligned seq lengths)")
+        print("=" * 70)
+        for block_size in args.block_sizes:
+            for seq_len in args.frag_seq_lengths:
+                for batch_size in args.batch_sizes:
+                    bm = _create_block_manager(
+                        args.num_kv_blocks, block_size,
+                        args.n_head, head_dim,
+                        args.n_layers,
+                    )
+                    blocks_needed = batch_size * (
+                        (seq_len + block_size - 1) // block_size
+                    )
+                    if blocks_needed > args.num_kv_blocks:
+                        continue
+                    frag_row = benchmark_fragmentation(
+                        bm, batch_size, seq_len, block_size,
+                        contiguous_max_seq_len=args.n_positions,
+                    )
+                    row = {
+                        "block_size": block_size,
+                        "batch_size": batch_size,
+                        "seq_len": seq_len,
+                        "n_positions": args.n_positions,
+                        **frag_row,
+                    }
+                    frag_results.append(row)
+                    print(f"  [bs={block_size}, batch={batch_size}, seq={seq_len}] "
+                          f"int_frag={frag_row['internal_frag']:.4f} "
+                          f"savings_vs_contig={frag_row['memory_savings_ratio']:.4f} "
+                          f"({frag_row['kv_bytes_paged']/1024:.1f}KB paged "
+                          f"vs {frag_row['kv_bytes_contiguous_naive']/1024:.1f}KB contig)")
+
+        if frag_results:
+            frag_file = os.path.join(args.output_dir, "fragmentation_results.csv")
+            with open(frag_file, "w", newline="") as f:
+                writer = csv.DictWriter(f, fieldnames=list(frag_results[0].keys()))
+                writer.writeheader()
+                writer.writerows(frag_results)
+            print(f"\nFragmentation results written to {frag_file}")
+
+    # Write main CSV
     if all_results:
         fieldnames = list(all_results[0].keys())
         with open(results_file, "w", newline="") as f:
